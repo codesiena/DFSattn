@@ -92,6 +92,11 @@ class Wan_DFSAttn_Processor2_0:
         sparsity_dcrt,
         cache_flag,
         cross_flag,
+        dense_step_idx=-1,
+        dense_interval=0,
+        rest_steps=0,
+        skip_steps2=0,
+        record_density=False,
     ):
         self.mode = mode
         self.sparsity = sparsity
@@ -106,6 +111,11 @@ class Wan_DFSAttn_Processor2_0:
         self.sparsity_dcrt = sparsity_dcrt
         self.cache_flag = cache_flag
         self.cross_flag = cross_flag
+        self.dense_step_idx = dense_step_idx
+        self.dense_interval = dense_interval
+        self.rest_steps = rest_steps
+        self.skip_steps2 = skip_steps2
+        self.record_density = record_density
 
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError(
@@ -230,7 +240,24 @@ class Wan_DFSAttn_Processor2_0:
         max_seqlen_q, max_seqlen_kv = S_q, S_k
         
         if self.mode == "dfs" and self.cross_flag is False:
-            if self.layer_idx not in self.skip_layers and self.step_idx >= self.skip_steps * 2: 
+            real_step = self.step_idx // 2
+            phase_rest_end = self.skip_steps + self.rest_steps
+            phase_sparse2_start = phase_rest_end + self.skip_steps2
+            in_rest_phase = self.skip_steps <= real_step < phase_rest_end
+            in_sparse2_phase = real_step >= phase_sparse2_start
+            in_sparse_phase = in_rest_phase or in_sparse2_phase
+            is_periodic_dense = (
+                self.dense_interval > 0
+                and real_step >= self.skip_steps
+                and (real_step - self.skip_steps + 1) % self.dense_interval == 0
+            )
+            if self.step_idx == self.dense_step_idx or is_periodic_dense:
+                hidden_states = full_attention(
+                    query, key, value,
+                    mode="flash", drop_rate=0.0, attn_mask=attention_mask, causal=False, \
+                    cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv, \
+                    max_seqlen_q=max_seqlen_q, max_seqlen_kv=max_seqlen_kv, batch_size=query.shape[0])
+            elif self.layer_idx not in self.skip_layers and in_sparse_phase:
                 hidden_states = dfs_attention(
                     query,
                     key,
@@ -245,6 +272,7 @@ class Wan_DFSAttn_Processor2_0:
                     block_size=self.block_size,
                     video_perm=self.video_perm,
                     cache_flag=self.cache_flag,
+                    record_density=self.record_density,
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_kv=cu_seqlens_kv,
                     max_seqlen_q=max_seqlen_q,

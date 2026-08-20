@@ -4,6 +4,116 @@ import seaborn as sns
 import numpy as np
 import torch
 
+
+def export_block_mask(
+    mask,
+    save_dir,
+    step_idx,
+    layer_idx,
+    head_indices=(0,),
+    save_bool=False,
+):
+    """Save per-head top-k heatmaps, optionally keeping the bool array.
+
+    ``head_indices`` controls which heads are rendered as PNGs; pass ``None``
+    to render all. The raw bool array is disabled by default to avoid writing
+    large intermediate files.
+    """
+    if isinstance(mask, torch.Tensor):
+        mask_np = mask.detach().to(device="cpu", dtype=torch.bool).numpy()
+    else:
+        mask_np = np.asarray(mask, dtype=bool)
+
+    if mask_np.ndim == 2:
+        mask_np = mask_np[None, ...]
+    if mask_np.ndim != 3:
+        raise ValueError(
+            "block mask must have shape [heads, query_blocks, key_blocks] "
+            f"or [query_blocks, key_blocks], got {mask_np.shape}"
+        )
+
+    layer_dir = os.path.join(
+        save_dir,
+        f"step_{step_idx:03d}",
+        f"layer_{layer_idx:02d}",
+    )
+    os.makedirs(layer_dir, exist_ok=True)
+
+    bool_path = None
+    if save_bool:
+        bool_path = os.path.join(layer_dir, "block_mask.npy")
+        np.save(bool_path, mask_np, allow_pickle=False)
+
+    if head_indices is None:
+        heads_to_render = range(mask_np.shape[0])
+    else:
+        heads_to_render = head_indices
+
+    png_paths = []
+    for head_idx in heads_to_render:
+        if head_idx < 0 or head_idx >= mask_np.shape[0]:
+            raise ValueError(
+                f"head index {head_idx} is out of range for {mask_np.shape[0]} heads"
+            )
+        png_paths.append(
+            block_mask_visualization(
+                mask_np[head_idx],
+                save_dir,
+                step_idx,
+                layer_idx,
+                head_idx,
+            )
+        )
+
+    return bool_path, png_paths
+
+
+def block_mask_visualization(mask, save_dir, step_idx, layer_idx, head_idx):
+    """Render selected top-k blocks with explicit query/key block coordinates."""
+    if isinstance(mask, torch.Tensor):
+        mask_np = mask.detach().to(device="cpu", dtype=torch.bool).numpy()
+    else:
+        mask_np = np.asarray(mask, dtype=bool)
+
+    if mask_np.ndim != 2:
+        raise ValueError(f"per-head block mask must be 2D, got {mask_np.shape}")
+
+    q_blocks, k_blocks = mask_np.shape
+    step_dir = os.path.join(save_dir, f"step_{step_idx:03d}")
+    layer_dir = os.path.join(step_dir, f"layer_{layer_idx:02d}")
+    os.makedirs(layer_dir, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    image = ax.imshow(
+        mask_np,
+        cmap="Blues",
+        vmin=0,
+        vmax=1,
+        origin="upper",
+        interpolation="nearest",
+        aspect="equal",
+    )
+
+    # Keep coordinates readable even when the block matrix is large.
+    x_step = max(1, int(np.ceil(k_blocks / 10)))
+    y_step = max(1, int(np.ceil(q_blocks / 10)))
+    ax.set_xticks(np.arange(0, k_blocks, x_step))
+    ax.set_yticks(np.arange(0, q_blocks, y_step))
+    ax.set_xlabel("Key block index")
+    ax.set_ylabel("Query block index")
+    density = float(mask_np.mean()) if mask_np.size else 0.0
+    ax.set_title(
+        f"Top-k block mask - Step {step_idx}, Layer {layer_idx}, Head {head_idx}\n"
+        f"shape={q_blocks}x{k_blocks}, selected={density:.2%}"
+    )
+    colorbar = fig.colorbar(image, ax=ax, ticks=[0, 1], fraction=0.046, pad=0.04)
+    colorbar.ax.set_yticklabels(["not selected", "selected"])
+
+    save_path = os.path.join(layer_dir, f"head_{head_idx:02d}_block_mask.png")
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return save_path
+
 def attention_map_visualization(attn_maps, save_dir, step_idx, layer_idx, head_idx):
 
     step_dir = os.path.join(save_dir, f"step_{step_idx:03d}")

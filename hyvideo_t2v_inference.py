@@ -7,8 +7,25 @@ import time
 from dfsattn.utils.seed import seed_everything
 from dfsattn.utils.logger import logger
 from dfsattn.utils.order import block3d_perm, hwf, fwh, hilbert3d_perm, hilbert2d_perm
-from dataloader import load_prompt_or_image
+from dataloader import load_prompt_or_image, prompt_folder_name
 from dfsattn.replace_hyvideo import HunyuanVideo_DFSAttn_Processor2_0
+from dfsattn.attention_hyvideo import DFS_Attention
+
+def str2bool(value):
+    return value.lower() in ("true", "1", "yes", "y")
+
+def parse_mask_heads(value):
+    if value.strip().lower() == "all":
+        return None
+    try:
+        heads = tuple(dict.fromkeys(int(item.strip()) for item in value.split(",")))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "block-mask heads must be comma-separated integers or 'all'"
+        ) from exc
+    if not heads or any(head < 0 for head in heads):
+        raise argparse.ArgumentTypeError("block-mask head indices must be non-negative")
+    return heads
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -35,6 +52,14 @@ def parse_args():
     parser.add_argument("--cache_interval", type=int, default=12, help="Diffusion-step interval between sparse mask refreshes")
     parser.add_argument("--sparsity_dcrt", type=float, default=0.1, help="Sparsity decrement applied every cache interval")
     parser.add_argument("--cache_flag", type=bool, default=True, help="Cache the sparse mask in dfs attention")
+    parser.add_argument("--dense_interval", type=int, default=0, help="Force a full dense attention step every N denoising steps after warmup (0 = never)")
+    parser.add_argument("--rest_steps", type=int, default=0, help="Sparse steps after warmup before the second dense warmup (0 = skip phase)")
+    parser.add_argument("--skip_steps2", type=int, default=0, help="Second dense warmup steps after rest_steps (0 = skip phase)")
+    parser.add_argument("--record_density", type=str2bool, default=False, help="Record the actual density of sparse attention masks per step")
+    parser.add_argument("--block_mask_dir", type=str, default=None, help="Root directory for top-k masks; a prompt-number/text subdirectory is created automatically")
+    parser.add_argument("--block_mask_heads", type=parse_mask_heads, default=(0,), help="Comma-separated heads to render as heatmaps, or 'all'")
+    parser.add_argument("--block_mask_layer_interval", type=int, default=15, help="Export every Nth layer (default: layers 0, 15, 30, ...)")
+    parser.add_argument("--block_mask_save_bool", type=str2bool, default=False, help="Also save the raw bool .npy mask (default: false)")
    
     args = parser.parse_args()
     if args.model_id is None:
@@ -54,6 +79,26 @@ if __name__ == "__main__":
     pipe.to("cuda")
 
     args.prompt, _ = load_prompt_or_image(args.prompt_source, args.prompt_idx, args.prompt, None)
+    args.prompt = args.prompt.strip()
+    if args.block_mask_dir is not None:
+        prompt_mask_dir = os.path.join(
+            args.block_mask_dir,
+            prompt_folder_name(args.prompt_idx, args.prompt),
+        )
+        DFS_Attention.configure_mask_export(
+            prompt_mask_dir,
+            args.block_mask_heads,
+            args.block_mask_layer_interval,
+            args.block_mask_save_bool,
+        )
+        logger.info("Top-k masks for prompt {} will be saved to {}", args.prompt_idx, prompt_mask_dir)
+    else:
+        DFS_Attention.configure_mask_export(
+            None,
+            args.block_mask_heads,
+            args.block_mask_layer_interval,
+            args.block_mask_save_bool,
+        )
 
     latent_f, latent_h, latent_w= args.num_frames // 4 + 1, args.height // 16, args.width // 16
     video_len = latent_f * latent_h * latent_w
@@ -89,6 +134,10 @@ if __name__ == "__main__":
                 args.cache_interval,
                 args.sparsity_dcrt,
                 args.cache_flag,
+                args.dense_interval,
+                args.rest_steps,
+                args.skip_steps2,
+                args.record_density,
             )
             processors_id += 1   
     transformer.set_attn_processor(attn_processors)
@@ -115,5 +164,9 @@ if __name__ == "__main__":
         os.makedirs(output_dir, exist_ok=True)
 
     export_to_video(output, args.output_file, fps=24)
+
+    if args.record_density:
+        output_dir = os.path.dirname(args.output_file) or "."
+        DFS_Attention.dump_density_records(os.path.join(output_dir, "density_records.csv"))
 
     

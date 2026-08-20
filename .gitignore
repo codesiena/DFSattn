@@ -58,3 +58,5 @@ dfsattn/qkv_block_variance.csv
 # Vendored dependency checkouts should be installed separately.
 Block-Sparse-Attention/
 dfsattn/kernels/3rdparty/
+examples/
+idea2/

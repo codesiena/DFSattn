@@ -179,6 +179,67 @@ python wan21_t2v_inference.py \
   --sparsity_dcrt 0.1
 ```
 
+## Export Top-k Block Masks
+
+Pass `--block_mask_dir` to either inference script to save the block matrix used
+by block-sparse attention after top-k selection:
+
+```bash
+python wan21_t2v_inference.py \
+  --model_id "$WAN_MODEL_ID" \
+  --prompt "A cat walks on the grass, realistic" \
+  --output_file output/wan_dfs.mp4 \
+  --mode dfs \
+  --block_mask_dir output/wan_block_masks \
+  --block_mask_heads 0,1 \
+  --block_mask_layer_interval 15
+```
+
+Masks are exported only when top-k is recomputed, not when a cached mask is
+reused. Each refresh produces files such as:
+
+```text
+output/wan_block_masks/
+└── prompt_000_a_cat_walks_on_the_grass_realistic/
+    └── step_024/layer_15/
+        ├── head_00_block_mask.png
+        └── head_01_block_mask.png
+```
+
+The prompt directory always includes its zero-based prompt number and, when
+possible, a filesystem-safe excerpt of the prompt text. This keeps masks from
+different prompts separate and identifiable.
+
+Only PNG heatmaps are saved by default, for layers `0, 15, 30, ...`. PNGs use
+white for unselected blocks and blue for selected blocks. The default renders
+head 0; use `--block_mask_heads all` to render every head. Coordinates refer to
+the reordered block matrix actually passed to the sparse attention kernel. Use
+`--block_mask_layer_interval 1` to export every layer, or
+`--block_mask_save_bool true` if the raw bool array is also needed.
+
+```python
+import numpy as np
+
+# Only available when --block_mask_save_bool true is used.
+mask = np.load(
+    "output/wan_block_masks/prompt_000_a_cat_walks_on_the_grass_realistic/"
+    "step_024/layer_15/block_mask.npy"
+)
+print(mask.dtype, mask.shape)
+print(np.argwhere(mask[0]))  # [query_block, key_block] for head 0
+```
+
+Compare one head at several diffusion steps while advancing through layers:
+
+```bash
+python make_block_mask_video.py \
+  --mask_dir output/hyvideo_masks/prompt_000_gwen_stacy_reading_a_book_surrealism_style \
+  --steps 12 24 36 \
+  --head 0 \
+  --fps 4 \
+  --output output/hyvideo_masks/head_00_steps_12_24_36_by_layer.mp4
+```
+
 ## Batch Inference
 
 The launch scripts are configured through environment variables and do not depend on local absolute paths.
@@ -186,16 +247,18 @@ The launch scripts are configured through environment variables and do not depen
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
 HYVIDEO_MODEL_ID=/path/to/HunyuanVideo \
-PROMPT_FILE=examples/prompts.txt \
+PROMPT_FILE=examples/vbench_11_prompts.txt \
 OUTPUT_DIR=output/hyvideo/dfs \
+BLOCK_MASK_DIR=output/hyvideo/masks \
 ./hyvideo_t2v_720p_dfs.sh
 ```
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
 WAN_MODEL_ID=/path/to/Wan2.1-T2V-14B \
-PROMPT_FILE=examples/prompts.txt \
+PROMPT_FILE=examples/vbench_11_prompts.txt \
 OUTPUT_DIR=output/wan/dfs \
+BLOCK_MASK_DIR=output/wan/masks \
 ./wan21_t2v_720p_dfs.sh
 ```
 
@@ -206,6 +269,8 @@ Useful script variables:
 - `START_IDX` and `END_IDX`: inclusive prompt index range.
 - `SPARSITY`, `SKIP_STEPS`, `CACHE_INTERVAL`, `SPARSITY_DCRT`, `TILE_SIZE`, `BLOCK_SIZE`, `ORDER`: DFSAttn parameters.
 - `HEIGHT`, `WIDTH`, `NUM_FRAMES`, `NUM_INFERENCE_STEPS`, `SEED`: generation settings.
+- `BLOCK_MASK_DIR`: enable top-k mask export; inference creates a `prompt_NNN_<prompt-text>` subdirectory.
+- `BLOCK_MASK_HEADS`: comma-separated heads to render, or `all` (default: `0`).
 
 ## Default Parameters
 

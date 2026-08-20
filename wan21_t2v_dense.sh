@@ -6,16 +6,12 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# block_sparse_attn 在 import 阶段就需要 torch 动态库
+export LD_LIBRARY_PATH="/work/liutt/miniconda3/envs/SVG/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
+
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 echo "CUDA_VISIBLE_DEVICES is set to: $CUDA_VISIBLE_DEVICES"
 
-sparsity="${SPARSITY:-0.3}"
-skip_steps="${SKIP_STEPS:-12}"
-cache_interval="${CACHE_INTERVAL:-12}"
-sparsity_dcrt="${SPARSITY_DCRT:-0.1}"
-tile_size="${TILE_SIZE:-16}"
-block_size="${BLOCK_SIZE:-128}"
-order="${ORDER:-hilbert3d}"
 prompt_set="${PROMPT_SET:-11}"
 if [ "$prompt_set" = "33" ]; then
     default_prompt_file="${REPO_ROOT}/examples/vbench_33_prompts.txt"
@@ -24,19 +20,13 @@ else
 fi
 prompt_file="${PROMPT_FILE:-$default_prompt_file}"
 res_root="$(cd "${REPO_ROOT}/../.." && pwd)/res"
+output_dir="${OUTPUT_DIR:-${res_root}/wan/dense/vbench${prompt_set}}"
 start_idx="${START_IDX:-0}"
 seed="${SEED:-42}"
 height="${HEIGHT:-480}"
 width="${WIDTH:-832}"
 num_frames="${NUM_FRAMES:-81}"
 num_inference_steps="${NUM_INFERENCE_STEPS:-50}"
-dense_interval="${DENSE_INTERVAL:-0}"
-rest_steps="${REST_STEPS:-0}"
-skip_steps2="${SKIP_STEPS2:-0}"
-record_density="${RECORD_DENSITY:-False}"
-block_mask_dir="${BLOCK_MASK_DIR:-}"
-block_mask_heads="${BLOCK_MASK_HEADS:-0}"
-output_dir="${OUTPUT_DIR:-${res_root}/wan/dfs_${height}x${width}_skip${skip_steps}_di${dense_interval}_vbench${prompt_set}}"
 model_id="${WAN_MODEL_ID:-}"
 
 if [ -z "$model_id" ]; then
@@ -65,14 +55,6 @@ for prompt_idx in $(seq "$start_idx" "$end_idx"); do
 
     echo "Processing prompt $prompt_idx..."
 
-    block_mask_args=()
-    if [ -n "$block_mask_dir" ]; then
-        block_mask_args=(
-            --block_mask_dir "$block_mask_dir"
-            --block_mask_heads "$block_mask_heads"
-        )
-    fi
-
     python "${REPO_ROOT}/wan21_t2v_inference.py" \
         --model_id "$model_id" \
         --seed "$seed" \
@@ -84,20 +66,7 @@ for prompt_idx in $(seq "$start_idx" "$end_idx"); do
         --prompt_source "T2V_Wan_VBench" \
         --prompt_idx "$prompt_idx" \
         --output_file "$out_file" \
-        --mode "dfs" \
-        --sparsity "$sparsity" \
-        --tile_size "$tile_size" \
-        --block_size "$block_size" \
-        --skip_steps "$skip_steps" \
-        --cache_interval "$cache_interval" \
-        --sparsity_dcrt "$sparsity_dcrt" \
-        --order "$order" \
-        --cache_flag True \
-        --dense_interval "$dense_interval" \
-        --rest_steps "$rest_steps" \
-        --skip_steps2 "$skip_steps2" \
-        --record_density "$record_density" \
-        "${block_mask_args[@]}"
+        --mode "flash"
 
     echo "Successfully generated video for prompt $prompt_idx"
 done

@@ -1,5 +1,17 @@
 import json
 import os
+import re
+import unicodedata
+
+
+def prompt_folder_name(prompt_idx, prompt, max_prompt_chars=56):
+    """Return a filesystem-safe folder name containing prompt id and text."""
+    prompt = unicodedata.normalize("NFKD", str(prompt).strip())
+    prompt = prompt.encode("ascii", "ignore").decode("ascii").lower()
+    prompt_slug = re.sub(r"[^a-z0-9]+", "_", prompt).strip("_")
+    prompt_slug = prompt_slug[:max_prompt_chars].rstrip("_")
+    prefix = f"prompt_{int(prompt_idx):03d}"
+    return f"{prefix}_{prompt_slug}" if prompt_slug else prefix
 
 
 def load_prompt(prompt_list_path):
@@ -63,4 +75,3 @@ def load_prompt_or_image(prompt_source, prompt_idx, prompt, image_path):
         return prompt, None
     else:
         raise ValueError(f"Invalid prompt source: {prompt_source}")
-

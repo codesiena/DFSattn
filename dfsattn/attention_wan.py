@@ -54,6 +54,14 @@ def _compute_cache_schedule(
 
 class DFS_Attention(nn.Module):
     _cached_metadata: Dict[int, Dict[str, Any]] = {}
+    mask_output_dir: Optional[str] = None
+    mask_head_indices: Optional[Tuple[int, ...]] = (0,)
+    mask_layer_interval: int = 15
+    mask_save_bool: bool = False
+    # Toggle for recording the actual density of sparse attention masks
+    record_density: bool = False
+    # Recorded actual densities keyed by step_idx -> {layer_idx: density}
+    density_records: Dict[int, Dict[int, float]] = {}
 
     def __init__(
         self, 
@@ -332,6 +340,7 @@ class DFS_Attention(nn.Module):
         permutation, inverse_permutation = self._compute_permutation(video_perm, seq_len, device)
         
         block_mask = None
+        mask_recomputed = False
 
         # Get cached block mask if available
         cache_entry = (
@@ -353,6 +362,7 @@ class DFS_Attention(nn.Module):
                     permutation,
                     self.sparse_ratio,
                 )
+            mask_recomputed = True
 
             if self.cache_flag:
                 DFS_Attention._cached_metadata[
@@ -361,30 +371,118 @@ class DFS_Attention(nn.Module):
                     "block_mask": block_mask.clone(),  # Clone but keep on same device
                 }
 
-            output = self._run_block_sparse_attention(
-                q, k, v, permutation, inverse_permutation,
-                block_mask, self.block_size, self.block_size,
-                cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
-                attn_mask, causal, drop_rate, batch_size,
-            )
-            
-            return output
+        should_export_mask = (
+            mask_recomputed
+            and DFS_Attention.mask_output_dir is not None
+            and DFS_Attention.mask_layer_interval > 0
+            and self.layer_idx % DFS_Attention.mask_layer_interval == 0
+        )
+        if should_export_mask:
+            from .utils.visualization import export_block_mask
 
-        else:
-            # Using cached block mask
-            output = self._run_block_sparse_attention(
-                q, k, v, permutation, inverse_permutation,
-                block_mask, self.block_size, self.block_size,
-                cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
-                attn_mask, causal, drop_rate, batch_size
+            bool_path, png_paths = export_block_mask(
+                block_mask,
+                DFS_Attention.mask_output_dir,
+                self.step_idx,
+                self.layer_idx,
+                DFS_Attention.mask_head_indices,
+                DFS_Attention.mask_save_bool,
             )
-            
-            return output
-    
+            logger.info(
+                "Saved top-k block heatmaps for step {} layer {} ({} heatmap(s)){}",
+                self.step_idx,
+                self.layer_idx,
+                len(png_paths),
+                " and bool mask to " + bool_path if bool_path else "",
+            )
+
+        # Record the actual density of the sparse mask for this step if enabled
+        if DFS_Attention.record_density:
+            with torch.no_grad():
+                actual_density = block_mask.float().mean().item()
+            DFS_Attention.density_records.setdefault(self.step_idx, {})[self.layer_idx] = actual_density
+
+        output = self._run_block_sparse_attention(
+            q, k, v, permutation, inverse_permutation,
+            block_mask, self.block_size, self.block_size,
+            cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
+            attn_mask, causal, drop_rate, batch_size,
+        )
+
+        return output
+
     @classmethod
     def clear_cache(cls):
         """Clear the sparse indices cache and all device-specific permutation caches"""
         cls._cached_metadata.clear()
+        cls.density_records.clear()
+
+    @classmethod
+    def configure_mask_export(
+        cls,
+        output_dir: Optional[str],
+        head_indices: Optional[Tuple[int, ...]] = (0,),
+        layer_interval: int = 15,
+        save_bool: bool = False,
+    ):
+        """Configure heatmap export for newly computed top-k masks."""
+        if layer_interval < 1:
+            raise ValueError("layer_interval must be at least 1")
+        cls.mask_output_dir = output_dir
+        cls.mask_head_indices = head_indices
+        cls.mask_layer_interval = layer_interval
+        cls.mask_save_bool = bool(save_bool)
+
+    @classmethod
+    def set_record_density(cls, enabled: bool):
+        """Toggle recording of the actual density of sparse attention masks"""
+        cls.record_density = bool(enabled)
+        if not cls.record_density:
+            cls.density_records.clear()
+
+    @classmethod
+    def get_density_records(cls) -> Dict[int, Dict[int, float]]:
+        """Return recorded actual densities: {step_idx: {layer_idx: density}}"""
+        return cls.density_records
+
+    @classmethod
+    def dump_density_records(cls, output_path: Optional[str] = None) -> Optional[str]:
+        """Print recorded densities and optionally save them to a CSV file.
+
+        CSV columns: step_idx, layer_idx, density (fraction of kept blocks).
+        """
+        records = cls.density_records
+        if not records:
+            logger.warning("No density records found. Make sure record_density was enabled during generation.")
+            return None
+
+        flat = []
+        for step in sorted(records):
+            for layer, density in sorted(records[step].items()):
+                flat.append((step, layer, density))
+
+        header = f"{'step_idx':>9} {'layer_idx':>10} {'density':>9} {'density%':>9}"
+        print("\n===== DFS Attention actual density records =====")
+        print(header)
+        print("-" * len(header))
+        step_sums: Dict[int, float] = {}
+        for step, layer, density in flat:
+            step_sums[step] = step_sums.get(step, 0.0) + density
+            print(f"{step:>9} {layer:>10} {density:>9.4f} {density * 100:>9.2f}")
+        all_mean = sum(d for _, _, d in flat) / len(flat)
+        print(f"\nMean density over all layers/steps: {all_mean:.4f} ({all_mean * 100:.2f}%)")
+        step_mean = sum(step_sums.values()) / len(step_sums)
+        print(f"Mean density per step (averaged over layers): {step_mean:.4f} ({step_mean * 100:.2f}%)")
+        print("================================================")
+
+        if output_path is not None:
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            with open(output_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["step_idx", "layer_idx", "density"])
+                writer.writerows(flat)
+            print(f"Density records saved to: {output_path}")
+        return output_path
 
     @classmethod
     def get_cache_info(cls) -> Dict:
@@ -410,6 +508,7 @@ def dfs_attention(
     block_size: int = 128,
     video_perm: Optional[torch.Tensor] = None,
     cache_flag: bool = True,
+    record_density: bool = False,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_kv: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
@@ -432,6 +531,8 @@ def dfs_attention(
         tile_size (int): Tile size for both q and k
         block_size (int): Block dimension for sparse attention
         video_perm (Optional[torch.Tensor]): Video permutation tensor
+        cache_flag (bool): Whether to cache the sparse block mask
+        record_density (bool): Whether to record the actual density of sparse masks (stored in DFS_Attention.density_records)
         cu_seqlens_q (Optional[torch.Tensor]): Cumulative sequence lengths for q
         cu_seqlens_kv (Optional[torch.Tensor]): Cumulative sequence lengths for k and v
         max_seqlen_q (Optional[int]): Maximum sequence length for q
@@ -469,6 +570,10 @@ def dfs_attention(
     )
     dfs_attn.sparse_ratio = current_sparsity
     dfs_attn.cache_flag = cache_flag and is_cache_step
+
+    # Enable global recording of actual densities (latch on once enabled)
+    if record_density and not DFS_Attention.record_density:
+        DFS_Attention.set_record_density(True)
 
     # Call forward method
     # Input is already in [B, H, L, D] format which DFS_Attention expects

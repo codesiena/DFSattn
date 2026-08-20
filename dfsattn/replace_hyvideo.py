@@ -36,6 +36,10 @@ class HunyuanVideo_DFSAttn_Processor2_0:
         cache_interval,
         sparsity_dcrt,
         cache_flag,
+        dense_interval=0,
+        rest_steps=0,
+        skip_steps2=0,
+        record_density=False,
     ):
         self.mode = mode
         self.sparsity = sparsity
@@ -50,6 +54,10 @@ class HunyuanVideo_DFSAttn_Processor2_0:
         self.cache_interval = cache_interval
         self.sparsity_dcrt = sparsity_dcrt
         self.cache_flag = cache_flag
+        self.dense_interval = dense_interval
+        self.rest_steps = rest_steps
+        self.skip_steps2 = skip_steps2
+        self.record_density = record_density
 
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("HunyuanVideoAttnProcessor2_0 requires PyTorch 2.0. To use it, please upgrade PyTorch to 2.0.")
@@ -147,7 +155,17 @@ class HunyuanVideo_DFSAttn_Processor2_0:
         # 5. Attention
         cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv = self.get_cu_max_seqlen(attention_mask, query.device)
         if self.mode == "dfs":
-            if self.layer_idx not in self.skip_layers and self.step_idx >= self.skip_steps: 
+            phase_rest_end = self.skip_steps + self.rest_steps
+            phase_sparse2_start = phase_rest_end + self.skip_steps2
+            in_rest_phase = self.skip_steps <= self.step_idx < phase_rest_end
+            in_sparse2_phase = self.step_idx >= phase_sparse2_start
+            in_sparse_phase = in_rest_phase or in_sparse2_phase
+            is_periodic_dense = (
+                self.dense_interval > 0
+                and self.step_idx >= self.skip_steps
+                and (self.step_idx - self.skip_steps + 1) % self.dense_interval == 0
+            )
+            if self.layer_idx not in self.skip_layers and in_sparse_phase and not is_periodic_dense:
                 hidden_states = dfs_attention(
                     query,
                     key,
@@ -163,6 +181,7 @@ class HunyuanVideo_DFSAttn_Processor2_0:
                     video_len=self.video_len,
                     video_perm=self.video_perm,
                     cache_flag=self.cache_flag,
+                    record_density=self.record_density,
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_kv=cu_seqlens_kv,
                     max_seqlen_q=max_seqlen_q,
