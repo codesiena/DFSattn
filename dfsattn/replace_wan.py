@@ -97,6 +97,11 @@ class Wan_DFSAttn_Processor2_0:
         rest_steps=0,
         skip_steps2=0,
         record_density=False,
+        sparse_execution="native",
+        hybrid_threshold=8,
+        flashinfer64_top_p=0.25,
+        flashinfer64_token_top_k=None,
+        flashinfer64_token_top_ratio=0.10,
     ):
         self.mode = mode
         self.sparsity = sparsity
@@ -116,6 +121,11 @@ class Wan_DFSAttn_Processor2_0:
         self.rest_steps = rest_steps
         self.skip_steps2 = skip_steps2
         self.record_density = record_density
+        self.sparse_execution = sparse_execution
+        self.hybrid_threshold = hybrid_threshold
+        self.flashinfer64_top_p = flashinfer64_top_p
+        self.flashinfer64_token_top_k = flashinfer64_token_top_k
+        self.flashinfer64_token_top_ratio = flashinfer64_token_top_ratio
 
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError(
@@ -277,6 +287,11 @@ class Wan_DFSAttn_Processor2_0:
                     cu_seqlens_kv=cu_seqlens_kv,
                     max_seqlen_q=max_seqlen_q,
                     max_seqlen_kv=max_seqlen_kv,
+                    sparse_execution=self.sparse_execution,
+                    hybrid_threshold=self.hybrid_threshold,
+                    flashinfer64_top_p=self.flashinfer64_top_p,
+                    flashinfer64_token_top_k=self.flashinfer64_token_top_k,
+                    flashinfer64_token_top_ratio=self.flashinfer64_token_top_ratio,
                 )
             else:
                 hidden_states = full_attention(

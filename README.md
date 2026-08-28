@@ -253,6 +253,22 @@ BLOCK_MASK_DIR=output/hyvideo/masks \
 ./hyvideo_t2v_720p_dfs.sh
 ```
 
+Run coarse Top-k followed by local `16x16` sub-block Top-p (`kp` mode):
+
+```bash
+SELECTOR_MODE=kp \
+FINE_TOP_P=0.9 \
+START_IDX=0 \
+END_IDX=1 \
+bash hyvideo_t2v_720p_dfs.sh
+```
+
+`SPARSITY` continues to control the upstream `128x128` coarse Top-k budget.
+Within every selected coarse block, KP jointly ranks its 64 fine scores and
+keeps the smallest set whose cumulative score reaches `FINE_TOP_P`.  KP uses
+the Q-stationary Triton backend automatically; its current supported geometry
+is `BLOCK_SIZE=128` and `TILE_SIZE=16`.
+
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
 WAN_MODEL_ID=/path/to/Wan2.1-T2V-14B \
@@ -268,6 +284,9 @@ Useful script variables:
 - `OUTPUT_DIR`: directory for generated videos.
 - `START_IDX` and `END_IDX`: inclusive prompt index range.
 - `SPARSITY`, `SKIP_STEPS`, `CACHE_INTERVAL`, `SPARSITY_DCRT`, `TILE_SIZE`, `BLOCK_SIZE`, `ORDER`: DFSAttn parameters.
+- `SELECTOR_MODE`: `topk` (default) or coarse-Top-k/fine-Top-p `kp`.
+- `FINE_TOP_P`: fine cumulative mass for `kp` (default: `0.9`).
+- `SPARSE_EXECUTION=flashinfer64`: independent 64x64 routing. `FLASHINFER64_ROUTE_MODE=topp_topk` sends tile Top-p to FlashInfer and uses ratio-based residual token Top-k (`FLASHINFER64_TOKEN_TOP_RATIO`). `FLASHINFER64_ROUTE_MODE=topk_topp` sends ratio-based tile Top-k (`FLASHINFER64_TILE_TOP_RATIO`) to FlashInfer and evaluates residual token Top-p (`FLASHINFER64_TOKEN_TOP_P`) separately.
 - `HEIGHT`, `WIDTH`, `NUM_FRAMES`, `NUM_INFERENCE_STEPS`, `SEED`: generation settings.
 - `BLOCK_MASK_DIR`: enable top-k mask export; inference creates a `prompt_NNN_<prompt-text>` subdirectory.
 - `BLOCK_MASK_HEADS`: comma-separated heads to render, or `all` (default: `0`).
@@ -283,6 +302,14 @@ Useful script variables:
 | `TILE_SIZE` / `--tile_size` | `16` | Token grouping granularity for hierarchical scoring. |
 | `BLOCK_SIZE` / `--block_size` | `128` | Block size used by block-sparse attention. |
 | `ORDER` / `--order` | `hilbert3d` | Token ordering strategy. |
+
+The independent `flashinfer64` backend does not reuse the historical
+Hybrid/KP route. It selects full 64x64 tiles independently per head and q64
+block, runs them with FlashInfer's variable block-sparse wrapper, ranks tokens
+inside unselected tiles per query, runs the residual list with the new Triton
+kernel, and merges both normalized states using LSE. It requires CUDA and a
+FlashInfer build exposing `VariableBlockSparseAttentionWrapper`; the CPU path
+in `dfsattn/flashinfer64_attention.py` is only a correctness reference.
 
 DFSAttn runs full attention for the first `SKIP_STEPS` diffusion steps. After
 that, it starts from `SPARSITY` and refreshes the sparse mask every

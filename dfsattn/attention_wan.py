@@ -21,7 +21,21 @@ try:
 except ImportError:
     flash_attn_varlen_func = None
 
-from block_sparse_attn import block_sparse_attn_func
+try:
+    from block_sparse_attn import block_sparse_attn_func
+except ImportError:
+    block_sparse_attn_func = None
+
+from .hybrid_block_attention import HybridPlan, hybrid_sparse_attention_from_plan, partition_block_mask
+from .flex64_attention import (
+    build_flex64_block_mask,
+    flex64_attention,
+    topk_indices_from_mask,
+)
+from .utils.timing import AttentionTimingRecorder
+from .flashinfer64_attention import FlashInfer64Attention
+
+_flashinfer64_instances = {}
 
 
 def _compute_cache_schedule(
@@ -53,7 +67,9 @@ def _compute_cache_schedule(
 
 
 class DFS_Attention(nn.Module):
-    _cached_metadata: Dict[int, Dict[str, Any]] = {}
+    # Mask granularity is part of the cache identity. Native uses 128x128,
+    # while Hybrid consumes the same selector at 16x16.
+    _cached_metadata: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
     mask_output_dir: Optional[str] = None
     mask_head_indices: Optional[Tuple[int, ...]] = (0,)
     mask_layer_interval: int = 15
@@ -62,6 +78,10 @@ class DFS_Attention(nn.Module):
     record_density: bool = False
     # Recorded actual densities keyed by step_idx -> {layer_idx: density}
     density_records: Dict[int, Dict[int, float]] = {}
+    # Per-execution-tile metadata.  For flex64, ``execution_tile_density`` is
+    # exactly the proposed D_HW: selected 64x64 tiles / dense 64x64 tiles.
+    execution_tile_records: Dict[int, Dict[int, Dict[str, Any]]] = {}
+    timing_recorder = AttentionTimingRecorder()
 
     def __init__(
         self, 
@@ -73,6 +93,8 @@ class DFS_Attention(nn.Module):
         block_size: int = 128,
         q_tile_size: int = 32,
         k_tile_size: int = 32,
+        sparse_execution: str = "native",
+        hybrid_threshold: int = 8,
     ):
         super(DFS_Attention, self).__init__()
 
@@ -84,6 +106,8 @@ class DFS_Attention(nn.Module):
         self.block_size = block_size
         self.q_tile_size = q_tile_size
         self.k_tile_size = k_tile_size
+        self.sparse_execution = sparse_execution
+        self.hybrid_threshold = hybrid_threshold
     
 
     def _compute_permutation(self, video_perm: Optional[torch.Tensor], seq_len: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -119,6 +143,15 @@ class DFS_Attention(nn.Module):
             inverse_permutation = inverse_permutation.to(tensor.device, non_blocking=True)
         result = tensor[:, :, inverse_permutation, :]
         return result if result.is_contiguous() else result.contiguous()
+
+    def _mask_cache_key(self) -> Tuple[Any, ...]:
+        return (
+            self.layer_idx,
+            self.sparse_execution,
+            self.block_size,
+            self.q_tile_size,
+            self.k_tile_size,
+        )
 
 
     def _compute_tile_score(
@@ -176,10 +209,19 @@ class DFS_Attention(nn.Module):
         return tile_score
     
     
-    def _compute_block_mask(self, q: torch.Tensor, k: torch.Tensor, permutations: torch.Tensor, sparse_ratio: Optional[float] = None) -> torch.Tensor:
+    def _compute_block_mask(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        permutations: torch.Tensor,
+        sparse_ratio: Optional[float] = None,
+        return_indices: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         
         bsz, num_heads, seq_len, _ = q.shape
         assert bsz == 1, "DFS Attention with block sparse currently supports batch size 1."
+        if sparse_ratio is None:
+            sparse_ratio = self.sparse_ratio
 
 
         assert self.block_size % self.q_tile_size == 0, f"block_dim ({self.block_size}) must be divisible by q_tile_size ({self.q_tile_size})"
@@ -210,7 +252,13 @@ class DFS_Attention(nn.Module):
         selected_mask = torch.zeros((bsz, num_heads, q_block_num, k_block_num), dtype=torch.bool, device=q.device)
         selected_mask.scatter_(-1, topk_indices, True)
 
-        return selected_mask.squeeze(0)
+        selected_mask = selected_mask.squeeze(0)
+        if return_indices:
+            # These are precisely the K blocks selected for each Q block.  The
+            # flex64 backend consumes them directly, avoiding a mask->index
+            # conversion and preserving the fixed per-row Tensor-tile budget.
+            return selected_mask, topk_indices.squeeze(0).to(torch.int32)
+        return selected_mask
 
 
     def _run_block_sparse_attention(
@@ -231,10 +279,58 @@ class DFS_Attention(nn.Module):
         causal: bool,
         drop_rate: float,
         batch_size: int,
+        hybrid_plan: Optional[HybridPlan] = None,
+        flex_block_mask: Optional[Any] = None,
+        block_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
 
         assert batch_size == 1, "DFS Attention with block sparse currently supports batch size 1."
+
+        if self.sparse_execution == "hybrid":
+            if m_block_dim != 16 or n_block_dim != 16:
+                raise ValueError(
+                    "Hybrid DFSAttn requires a 16x16 logical mask; pass --block_size 16. "
+                    "Its Core path then groups 4x4 microblocks into 64x64 tiles."
+                )
+            if causal or drop_rate != 0.0 or attn_mask is not None:
+                raise ValueError("The initial Hybrid DFSAttn backend supports only non-causal attention without dropout or an extra token mask.")
+            q_perm = self._apply_permutation_in_place(q, permutation)
+            k_perm = self._apply_permutation_in_place(k, permutation)
+            v_perm = self._apply_permutation_in_place(v, permutation)
+            if hybrid_plan is None:
+                hybrid_plan = partition_block_mask(block_mask.bool(), threshold=self.hybrid_threshold)
+            x = hybrid_sparse_attention_from_plan(
+                q_perm, k_perm, v_perm, hybrid_plan,
+                timing_recorder=DFS_Attention.timing_recorder,
+                step_idx=self.step_idx,
+                layer_idx=self.layer_idx,
+            )
+            return self._apply_inverse_permutation(x, inverse_permutation)
+        if self.sparse_execution == "flex64":
+            if m_block_dim != 64 or n_block_dim != 64:
+                raise ValueError("flex64 requires a 64x64 execution mask; pass --block_size 64.")
+            if causal or drop_rate != 0.0 or attn_mask is not None:
+                raise ValueError(
+                    "The initial flex64 backend supports only non-causal attention without dropout or an extra token mask."
+                )
+            q_perm = self._apply_permutation_in_place(q, permutation)
+            k_perm = self._apply_permutation_in_place(k, permutation)
+            v_perm = self._apply_permutation_in_place(v, permutation)
+            if flex_block_mask is None:
+                if block_indices is None:
+                    block_indices = topk_indices_from_mask(block_mask.bool())
+                flex_block_mask = build_flex64_block_mask(
+                    block_indices, kv_blocks=math.ceil(k_perm.shape[2] / 64)
+                )
+            x = flex64_attention(q_perm, k_perm, v_perm, flex_block_mask, block_indices)
+            return self._apply_inverse_permutation(x, inverse_permutation)
+        if self.sparse_execution != "native":
+            raise ValueError(
+                f"Unknown sparse_execution={self.sparse_execution!r}; expected 'native', 'hybrid' or 'flex64'."
+            )
+        if block_sparse_attn_func is None:
+            raise ImportError("block_sparse_attn is unavailable; install its CUDA extension for native DFSAttn.")
 
         device = q.device
         _, num_heads, seq_len, head_dim = q.shape
@@ -281,24 +377,12 @@ class DFS_Attention(nn.Module):
         head_mask_type = torch.tensor([1] * num_heads, device=device, dtype=torch.int32)
 
         x = block_sparse_attn_func(
-            q_bs,
-            k_bs,
-            v_bs,
-            cu_seqlens_q,
-            cu_seqlens_kv,
-            # m_block_dim=m_block_dim,
-            # n_block_dim=n_block_dim,
-            head_mask_type=head_mask_type,
-            streaming_info=None,
-            base_blockmask=base_blockmask,
-            max_seqlen_q_=max_seqlen_q,
-            max_seqlen_k_=max_seqlen_kv,
-            p_dropout=drop_rate,
-            deterministic=False,
-            softmax_scale=None,
-            is_causal=causal,
-            exact_streaming=False,
-            return_attn_probs=False,
+            q_bs, k_bs, v_bs, cu_seqlens_q, cu_seqlens_kv,
+            head_mask_type=head_mask_type, streaming_info=None,
+            base_blockmask=base_blockmask, max_seqlen_q_=max_seqlen_q,
+            max_seqlen_k_=max_seqlen_kv, p_dropout=drop_rate,
+            deterministic=False, softmax_scale=None, is_causal=causal,
+            exact_streaming=False, return_attn_probs=False,
         )
 
         x = x.view(batch_size, seq_len, num_heads, head_dim)
@@ -340,36 +424,64 @@ class DFS_Attention(nn.Module):
         permutation, inverse_permutation = self._compute_permutation(video_perm, seq_len, device)
         
         block_mask = None
+        block_indices = None
+        flex_block_mask = None
         mask_recomputed = False
 
         # Get cached block mask if available
-        cache_entry = (
-            DFS_Attention._cached_metadata
-            .get(self.layer_idx)
-        )
+        cache_entry = DFS_Attention._cached_metadata.get(self._mask_cache_key())
 
         if cache_entry is not None:
             block_mask = cache_entry["block_mask"]
             if block_mask.device != device:
                 block_mask = block_mask.to(device, non_blocking=True)
+            block_indices = cache_entry.get("block_indices")
+            flex_block_mask = cache_entry.get("flex_block_mask")
 
 
+        selector_start = None
         if block_mask is None or self.cache_flag:
+            selector_start = DFS_Attention.timing_recorder.start(device)
+            topk_start = DFS_Attention.timing_recorder.start(device)
             with torch.no_grad():
                 block_mask = self._compute_block_mask(
                     q,
                     k,
                     permutation,
                     self.sparse_ratio,
+                    return_indices=self.sparse_execution == "flex64",
                 )
+                if self.sparse_execution == "flex64":
+                    block_mask, block_indices = block_mask
+                    flex_block_mask = build_flex64_block_mask(
+                        block_indices, kv_blocks=math.ceil(k.shape[2] / 64)
+                    )
+            DFS_Attention.timing_recorder.stop(
+                topk_start, phase="topk_mask", step_idx=self.step_idx,
+                layer_idx=self.layer_idx, device=device,
+            )
             mask_recomputed = True
 
             if self.cache_flag:
-                DFS_Attention._cached_metadata[
-                    self.layer_idx
-                ] = {
+                DFS_Attention._cached_metadata[self._mask_cache_key()] = {
                     "block_mask": block_mask.clone(),  # Clone but keep on same device
+                    "block_indices": block_indices,
+                    "flex_block_mask": flex_block_mask,
                 }
+
+        hybrid_plan = None
+        if self.sparse_execution == "hybrid":
+            routing_start = DFS_Attention.timing_recorder.start(device)
+            hybrid_plan = partition_block_mask(block_mask.bool(), threshold=self.hybrid_threshold)
+            DFS_Attention.timing_recorder.stop(
+                routing_start, phase="routing", step_idx=self.step_idx,
+                layer_idx=self.layer_idx, device=device,
+            )
+        if mask_recomputed:
+            DFS_Attention.timing_recorder.stop(
+                selector_start, phase="topk_routing", step_idx=self.step_idx,
+                layer_idx=self.layer_idx, device=device,
+            )
 
         should_export_mask = (
             mask_recomputed
@@ -396,17 +508,40 @@ class DFS_Attention(nn.Module):
                 " and bool mask to " + bool_path if bool_path else "",
             )
 
-        # Record the actual density of the sparse mask for this step if enabled
+        # Record the actual execution-tile budget.  The legacy scalar density
+        # remains for compatibility; the richer record is what experiments
+        # should use.  In flex64 mode this is the exact hardware tile density.
         if DFS_Attention.record_density:
             with torch.no_grad():
-                actual_density = block_mask.float().mean().item()
+                tile_counts = block_mask.sum(dim=-1)
+                tiles_executed = int(tile_counts.sum().item())
+                dense_tiles = int(block_mask.numel())
+                actual_density = tiles_executed / dense_tiles
             DFS_Attention.density_records.setdefault(self.step_idx, {})[self.layer_idx] = actual_density
+            DFS_Attention.execution_tile_records.setdefault(self.step_idx, {})[self.layer_idx] = {
+                "execution_backend": self.sparse_execution,
+                "execution_tile_size": self.block_size,
+                "q_tile_rows": int(block_mask.shape[-2]),
+                "k_tile_cols": int(block_mask.shape[-1]),
+                "tile_k_mean": float(tile_counts.float().mean().item()),
+                "tile_k_min": int(tile_counts.min().item()),
+                "tile_k_max": int(tile_counts.max().item()),
+                "tiles_executed": tiles_executed,
+                "tiles_dense": dense_tiles,
+                "execution_tile_density": actual_density,
+            }
 
+        attention_start = DFS_Attention.timing_recorder.start(device)
         output = self._run_block_sparse_attention(
             q, k, v, permutation, inverse_permutation,
             block_mask, self.block_size, self.block_size,
             cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
             attn_mask, causal, drop_rate, batch_size,
+            hybrid_plan, flex_block_mask, block_indices,
+        )
+        DFS_Attention.timing_recorder.stop(
+            attention_start, phase="attention_execution", step_idx=self.step_idx,
+            layer_idx=self.layer_idx, device=device,
         )
 
         return output
@@ -416,6 +551,8 @@ class DFS_Attention(nn.Module):
         """Clear the sparse indices cache and all device-specific permutation caches"""
         cls._cached_metadata.clear()
         cls.density_records.clear()
+        cls.execution_tile_records.clear()
+        _flashinfer64_instances.clear()
 
     @classmethod
     def configure_mask_export(
@@ -439,6 +576,20 @@ class DFS_Attention(nn.Module):
         cls.record_density = bool(enabled)
         if not cls.record_density:
             cls.density_records.clear()
+            cls.execution_tile_records.clear()
+
+    @classmethod
+    def set_record_timing(cls, enabled: bool):
+        """Enable CUDA-event timing without synchronizing every attention call."""
+        cls.timing_recorder.reset(bool(enabled))
+
+    @classmethod
+    def dump_timing_records(
+        cls,
+        output_path: str,
+        extra_totals: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Dict[str, float]]:
+        return cls.timing_recorder.dump_csv(output_path, extra_totals=extra_totals)
 
     @classmethod
     def get_density_records(cls) -> Dict[int, Dict[int, float]]:
@@ -446,42 +597,67 @@ class DFS_Attention(nn.Module):
         return cls.density_records
 
     @classmethod
-    def dump_density_records(cls, output_path: Optional[str] = None) -> Optional[str]:
-        """Print recorded densities and optionally save them to a CSV file.
+    def get_execution_tile_records(cls) -> Dict[int, Dict[int, Dict[str, Any]]]:
+        """Return per-layer execution-tile metadata collected with record_density."""
+        return cls.execution_tile_records
 
-        CSV columns: step_idx, layer_idx, density (fraction of kept blocks).
+    @classmethod
+    def dump_density_records(cls, output_path: Optional[str] = None) -> Optional[str]:
+        """Print and save execution-tile metrics collected during inference.
+
+        In ``flex64`` mode, ``execution_tile_density`` is the measured D_HW.
+        Other backends retain their own execution-mask granularity, so their
+        density is useful for baseline accounting but is not a 64x64 D_HW.
         """
-        records = cls.density_records
+        records = cls.execution_tile_records
         if not records:
             logger.warning("No density records found. Make sure record_density was enabled during generation.")
             return None
 
-        flat = []
+        flat: List[Dict[str, Any]] = []
         for step in sorted(records):
-            for layer, density in sorted(records[step].items()):
-                flat.append((step, layer, density))
+            for layer, metrics in sorted(records[step].items()):
+                flat.append({"step_idx": step, "layer_idx": layer, **metrics})
 
-        header = f"{'step_idx':>9} {'layer_idx':>10} {'density':>9} {'density%':>9}"
-        print("\n===== DFS Attention actual density records =====")
+        header = (
+            f"{'step_idx':>9} {'layer_idx':>10} {'backend':>10} "
+            f"{'tile':>6} {'k(mean)':>9} {'D_HW':>9}"
+        )
+        print("\n===== DFS Attention execution-tile records =====")
         print(header)
         print("-" * len(header))
         step_sums: Dict[int, float] = {}
-        for step, layer, density in flat:
+        step_counts: Dict[int, int] = {}
+        for row in flat:
+            step = int(row["step_idx"])
+            density = float(row["execution_tile_density"])
             step_sums[step] = step_sums.get(step, 0.0) + density
-            print(f"{step:>9} {layer:>10} {density:>9.4f} {density * 100:>9.2f}")
-        all_mean = sum(d for _, _, d in flat) / len(flat)
-        print(f"\nMean density over all layers/steps: {all_mean:.4f} ({all_mean * 100:.2f}%)")
-        step_mean = sum(step_sums.values()) / len(step_sums)
-        print(f"Mean density per step (averaged over layers): {step_mean:.4f} ({step_mean * 100:.2f}%)")
+            step_counts[step] = step_counts.get(step, 0) + 1
+            print(
+                f"{step:>9} {int(row['layer_idx']):>10} {str(row['execution_backend']):>10} "
+                f"{int(row['execution_tile_size']):>6} {float(row['tile_k_mean']):>9.2f} "
+                f"{density:>9.4f}"
+            )
+        all_mean = sum(float(row["execution_tile_density"]) for row in flat) / len(flat)
+        print(f"\nMean execution-tile density: {all_mean:.4f} ({all_mean * 100:.2f}%)")
+        step_mean = sum(
+            step_sums[step] / step_counts[step] for step in step_sums
+        ) / len(step_sums)
+        print(f"Mean per-step execution-tile density: {step_mean:.4f} ({step_mean * 100:.2f}%)")
         print("================================================")
 
         if output_path is not None:
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
             with open(output_path, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(["step_idx", "layer_idx", "density"])
+                fields = [
+                    "step_idx", "layer_idx", "execution_backend", "execution_tile_size",
+                    "q_tile_rows", "k_tile_cols", "tile_k_mean", "tile_k_min", "tile_k_max",
+                    "tiles_executed", "tiles_dense", "execution_tile_density",
+                ]
+                writer = csv.DictWriter(f, fieldnames=fields)
+                writer.writeheader()
                 writer.writerows(flat)
-            print(f"Density records saved to: {output_path}")
+            print(f"Execution-tile records saved to: {output_path}")
         return output_path
 
     @classmethod
@@ -513,6 +689,11 @@ def dfs_attention(
     cu_seqlens_kv: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_kv: Optional[int] = None,
+    sparse_execution: str = "native",
+    hybrid_threshold: int = 8,
+    flashinfer64_top_p: float = 0.25,
+    flashinfer64_token_top_k: Optional[int] = None,
+    flashinfer64_token_top_ratio: float = 0.10,
 ) -> torch.Tensor:
     """
     DFS Attention wrapper function adapted for replace_hyvideo.py structure.
@@ -542,6 +723,51 @@ def dfs_attention(
         torch.Tensor: Output tensor with shape [B, H, L, D]
     """
     
+    if sparse_execution == "flashinfer64":
+        backend = _flashinfer64_instances.setdefault(layer_idx, FlashInfer64Attention())
+        if record_density and not DFS_Attention.record_density:
+            DFS_Attention.set_record_density(True)
+        attention_start = DFS_Attention.timing_recorder.start(q.device)
+        output = backend(
+            q,
+            k,
+            v,
+            video_perm=video_perm,
+            video_len=None,
+            tile_top_p=flashinfer64_top_p,
+            token_top_k=flashinfer64_token_top_k,
+            token_top_ratio=flashinfer64_token_top_ratio,
+            refresh_route=cache_flag,
+            record_density=record_density,
+        )
+        DFS_Attention.timing_recorder.stop(
+            attention_start,
+            phase="attention_execution",
+            step_idx=step_idx,
+            layer_idx=layer_idx,
+            device=q.device,
+        )
+        if record_density and backend.last_stats is not None:
+            stats = backend.last_stats
+            total_possible = stats["total_possible"]
+            core_density = stats["core_interactions"] / total_possible
+            final_interactions = stats["core_interactions"] + stats["residual_token_interactions"]
+            final_density = final_interactions / total_possible
+            DFS_Attention.density_records.setdefault(step_idx, {})[layer_idx] = final_density
+            DFS_Attention.sparsity_records.setdefault(step_idx, {})[layer_idx] = {
+                "p_mass": float(flashinfer64_top_p),
+                "fine_top_p": float("nan"),
+                "token_top_k": float(-1 if flashinfer64_token_top_k is None else flashinfer64_token_top_k),
+                "token_top_ratio": float(flashinfer64_token_top_ratio),
+                "residual_candidate_blocks": float("nan"),
+                "block_density": core_density,
+                "realized_block_sparsity": 1.0 - core_density,
+                "residual_token_interactions": float(stats["residual_token_interactions"]),
+                "final_density": final_density,
+                "final_hybrid_sparsity": 1.0 - final_density,
+            }
+        return output
+
     instance_key = layer_idx
     
     # Get or create DFS_Attention instance for this layer
@@ -555,6 +781,8 @@ def dfs_attention(
             block_size,
             tile_size,
             tile_size,
+            sparse_execution,
+            hybrid_threshold,
         )
     
     # Get the instance and update step_idx
@@ -570,6 +798,8 @@ def dfs_attention(
     )
     dfs_attn.sparse_ratio = current_sparsity
     dfs_attn.cache_flag = cache_flag and is_cache_step
+    dfs_attn.sparse_execution = sparse_execution
+    dfs_attn.hybrid_threshold = hybrid_threshold
 
     # Enable global recording of actual densities (latch on once enabled)
     if record_density and not DFS_Attention.record_density:

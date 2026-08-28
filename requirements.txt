@@ -11,6 +11,8 @@ sentencepiece>=0.2.0
 ftfy>=6.3.0
 
 flash_attn>=2.7.4
+# Official FlashInfer package; required by the independent flashinfer64 backend.
+flashinfer-python>=0.2.10
 triton>=3.2.0
 
 numpy>=2.0.0

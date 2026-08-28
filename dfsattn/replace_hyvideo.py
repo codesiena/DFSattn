@@ -1,3 +1,6 @@
+import json
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -5,7 +8,7 @@ from diffusers.models.attention_processor import Attention
 from typing import Optional
 
 from .fullattention import full_attention
-from .attention_hyvideo import dfs_attention
+from .attention_hyvideo import DFS_Attention, dfs_attention
 from dfsattn.utils.logger import logger
 
 # Try to import fast kernels
@@ -19,6 +22,10 @@ except ImportError:
     apply_qk_rope_single = None
     apply_qk_rope_double = None
     logger.info("Fast CUDA/Triton kernels not available, using PyTorch fallback")
+
+
+class AttentionDebugComplete(RuntimeError):
+    """Internal clean-stop signal after requested debug layers are dumped."""
 
 
 class HunyuanVideo_DFSAttn_Processor2_0:
@@ -40,6 +47,23 @@ class HunyuanVideo_DFSAttn_Processor2_0:
         rest_steps=0,
         skip_steps2=0,
         record_density=False,
+        sparse_execution="native",
+        hybrid_threshold=8,
+        block_top_p=None,
+        token_top_k=0,
+        residual_candidate_blocks=4,
+        selector_mode="topk",
+        fine_top_p=0.9,
+        flashinfer64_top_p=0.25,
+        flashinfer64_token_top_k=None,
+        flashinfer64_token_top_ratio=0.10,
+        flashinfer64_route_mode="topp_topk",
+        flashinfer64_tile_top_ratio=0.25,
+        flashinfer64_token_top_p=0.9,
+        attention_debug_dir=None,
+        attention_debug_step=-1,
+        attention_debug_layers=(0,),
+        attention_debug_stop=True,
     ):
         self.mode = mode
         self.sparsity = sparsity
@@ -58,9 +82,88 @@ class HunyuanVideo_DFSAttn_Processor2_0:
         self.rest_steps = rest_steps
         self.skip_steps2 = skip_steps2
         self.record_density = record_density
+        self.sparse_execution = sparse_execution
+        self.hybrid_threshold = hybrid_threshold
+        self.block_top_p = block_top_p
+        self.token_top_k = token_top_k
+        self.residual_candidate_blocks = residual_candidate_blocks
+        self.selector_mode = selector_mode
+        self.fine_top_p = fine_top_p
+        self.flashinfer64_top_p = flashinfer64_top_p
+        self.flashinfer64_token_top_k = flashinfer64_token_top_k
+        self.flashinfer64_token_top_ratio = flashinfer64_token_top_ratio
+        self.flashinfer64_route_mode = flashinfer64_route_mode
+        self.flashinfer64_tile_top_ratio = flashinfer64_tile_top_ratio
+        self.flashinfer64_token_top_p = flashinfer64_token_top_p
+        self.attention_debug_dir = attention_debug_dir
+        self.attention_debug_step = (
+            skip_steps if attention_debug_step < 0 else attention_debug_step
+        )
+        self.attention_debug_layers = tuple(attention_debug_layers)
+        self.attention_debug_stop = bool(attention_debug_stop)
 
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("HunyuanVideoAttnProcessor2_0 requires PyTorch 2.0. To use it, please upgrade PyTorch to 2.0.")
+
+    def _dump_attention_debug(
+        self,
+        query,
+        key,
+        value,
+        sparse_output,
+        dense_output,
+        valid_sequence,
+    ):
+        """Persist exact first-divergence tensors plus compact error metrics."""
+        os.makedirs(self.attention_debug_dir, exist_ok=True)
+        if self.sparse_execution == "flashinfer64":
+            backend = f"flashinfer64_{self.flashinfer64_route_mode}"
+        else:
+            backend = f"dfsattn_{self.sparse_execution}_{self.selector_mode}"
+        stem = f"step{self.step_idx:03d}_layer{self.layer_idx:03d}_{backend}"
+        tensor_path = os.path.join(self.attention_debug_dir, stem + ".pt")
+        summary_path = os.path.join(self.attention_debug_dir, stem + ".json")
+
+        diff = sparse_output.float() - dense_output.float()
+        dense_norm = torch.linalg.vector_norm(dense_output.float()).clamp_min(1e-20)
+        per_head_mean = diff.abs().mean(dim=(0, 2, 3))
+        per_head_max = diff.abs().amax(dim=(0, 2, 3))
+        summary = {
+            "step_idx": self.step_idx,
+            "layer_idx": self.layer_idx,
+            "backend": backend,
+            "shape": list(query.shape),
+            "dtype": str(query.dtype),
+            "video_len": int(self.video_len),
+            "valid_sequence": int(valid_sequence),
+            "padding_sequence": int(query.shape[2] - valid_sequence),
+            "max_abs_error_vs_dense": float(diff.abs().max().item()),
+            "mean_abs_error_vs_dense": float(diff.abs().mean().item()),
+            "relative_l2_error_vs_dense": float(
+                (torch.linalg.vector_norm(diff) / dense_norm).item()
+            ),
+            "per_head_mean_abs_error": per_head_mean.cpu().tolist(),
+            "per_head_max_abs_error": per_head_max.cpu().tolist(),
+        }
+        del diff, dense_norm, per_head_mean, per_head_max
+
+        # CPU tensors make the dump portable and prevent torch.load from
+        # allocating GPU memory during the cross-backend comparison.
+        payload = {
+            "metadata": summary,
+            "query": query.detach().cpu(),
+            "key": key.detach().cpu(),
+            "value": value.detach().cpu(),
+            "sparse_output": sparse_output.detach().cpu(),
+            "dense_output": dense_output.detach().cpu(),
+        }
+        temporary_path = tensor_path + ".tmp"
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, tensor_path)
+        with open(summary_path + ".tmp", "w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=2)
+        os.replace(summary_path + ".tmp", summary_path)
+        logger.info("Attention debug dump saved to {}", tensor_path)
     
     def get_cu_max_seqlen(self, attention_mask, device):
         cu_seqlens_q = torch.tensor([0, attention_mask.sum(), attention_mask.numel()], dtype=torch.int32, device=device)
@@ -154,6 +257,7 @@ class HunyuanVideo_DFSAttn_Processor2_0:
 
         # 5. Attention
         cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv = self.get_cu_max_seqlen(attention_mask, query.device)
+        ran_sparse_attention = False
         if self.mode == "dfs":
             phase_rest_end = self.skip_steps + self.rest_steps
             phase_sparse2_start = phase_rest_end + self.skip_steps2
@@ -166,6 +270,7 @@ class HunyuanVideo_DFSAttn_Processor2_0:
                 and (self.step_idx - self.skip_steps + 1) % self.dense_interval == 0
             )
             if self.layer_idx not in self.skip_layers and in_sparse_phase and not is_periodic_dense:
+                ran_sparse_attention = True
                 hidden_states = dfs_attention(
                     query,
                     key,
@@ -186,20 +291,86 @@ class HunyuanVideo_DFSAttn_Processor2_0:
                     cu_seqlens_kv=cu_seqlens_kv,
                     max_seqlen_q=max_seqlen_q,
                     max_seqlen_kv=max_seqlen_kv,
+                    sparse_execution=self.sparse_execution,
+                    hybrid_threshold=self.hybrid_threshold,
+                    block_top_p=self.block_top_p,
+                    token_top_k=self.token_top_k,
+                    residual_candidate_blocks=self.residual_candidate_blocks,
+                    selector_mode=self.selector_mode,
+                    fine_top_p=self.fine_top_p,
+                    flashinfer64_top_p=self.flashinfer64_top_p,
+                    flashinfer64_token_top_k=self.flashinfer64_token_top_k,
+                    flashinfer64_token_top_ratio=self.flashinfer64_token_top_ratio,
+                    flashinfer64_route_mode=self.flashinfer64_route_mode,
+                    flashinfer64_tile_top_ratio=self.flashinfer64_tile_top_ratio,
+                    flashinfer64_token_top_p=self.flashinfer64_token_top_p,
+                    flashinfer64_valid_sequence=int(cu_seqlens_q[1].item()),
                 )
             else:
+                attention_start = DFS_Attention.timing_recorder.start(query.device)
                 hidden_states = full_attention(
                     query, key, value, 
                     mode="flash", drop_rate=0.0, attn_mask=attention_mask, causal=False, \
                     cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv, \
                     max_seqlen_q=max_seqlen_q, max_seqlen_kv=max_seqlen_kv, batch_size=query.shape[0])
+                DFS_Attention.timing_recorder.stop(
+                    attention_start, phase="attention_execution", step_idx=self.step_idx,
+                    layer_idx=self.layer_idx, device=query.device,
+                )
             
         elif self.mode in ["flash", "torch", "vanilla"]:
+            attention_start = DFS_Attention.timing_recorder.start(query.device)
             hidden_states = full_attention(
                     query, key, value, 
                     mode=self.mode, drop_rate=0.0, attn_mask=attention_mask, causal=False, \
                     cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv, \
                     max_seqlen_q=max_seqlen_q, max_seqlen_kv=max_seqlen_kv, batch_size=query.shape[0])
+            DFS_Attention.timing_recorder.stop(
+                attention_start, phase="attention_execution", step_idx=self.step_idx,
+                layer_idx=self.layer_idx, device=query.device,
+            )
+
+        debug_this_attention = (
+            ran_sparse_attention
+            and self.attention_debug_dir is not None
+            and self.step_idx == self.attention_debug_step
+            and self.layer_idx in self.attention_debug_layers
+        )
+        if debug_this_attention:
+            # Compute the reference on the exact same normalized/RoPE-applied
+            # Q/K/V. This is the first point at which the sparse trajectories
+            # can diverge, so no model-level effects are mixed into the error.
+            dense_debug_output = full_attention(
+                query,
+                key,
+                value,
+                mode="flash",
+                drop_rate=0.0,
+                attn_mask=attention_mask,
+                causal=False,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_kv,
+                batch_size=query.shape[0],
+            )
+            self._dump_attention_debug(
+                query,
+                key,
+                value,
+                hidden_states,
+                dense_debug_output,
+                int(cu_seqlens_q[1].item()),
+            )
+            del dense_debug_output
+            if (
+                self.attention_debug_stop
+                and self.layer_idx == max(self.attention_debug_layers)
+            ):
+                raise AttentionDebugComplete(
+                    f"completed attention debug dump at step {self.step_idx}, "
+                    f"layer {self.layer_idx}"
+                )
         
         hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)

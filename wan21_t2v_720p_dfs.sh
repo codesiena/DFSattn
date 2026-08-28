@@ -15,6 +15,12 @@ cache_interval="${CACHE_INTERVAL:-12}"
 sparsity_dcrt="${SPARSITY_DCRT:-0.1}"
 tile_size="${TILE_SIZE:-16}"
 block_size="${BLOCK_SIZE:-128}"
+sparse_execution="${SPARSE_EXECUTION:-native}"
+flashinfer64_top_p="${FLASHINFER64_TOP_P:-0.25}"
+flashinfer64_token_top_ratio="${FLASHINFER64_TOKEN_TOP_RATIO:-0.10}"
+if [ "$sparse_execution" = "flashinfer64" ]; then
+    export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+fi
 order="${ORDER:-hilbert3d}"
 prompt_set="${PROMPT_SET:-11}"
 if [ "$prompt_set" = "33" ]; then
@@ -34,6 +40,7 @@ dense_interval="${DENSE_INTERVAL:-0}"
 rest_steps="${REST_STEPS:-0}"
 skip_steps2="${SKIP_STEPS2:-0}"
 record_density="${RECORD_DENSITY:-False}"
+record_timing="${RECORD_TIMING:-True}"
 block_mask_dir="${BLOCK_MASK_DIR:-}"
 block_mask_heads="${BLOCK_MASK_HEADS:-0}"
 output_dir="${OUTPUT_DIR:-${res_root}/wan/dfs_${height}x${width}_skip${skip_steps}_di${dense_interval}_vbench${prompt_set}}"
@@ -73,6 +80,10 @@ for prompt_idx in $(seq "$start_idx" "$end_idx"); do
         )
     fi
 
+    flashinfer64_args=(
+        --flashinfer64_top_p "$flashinfer64_top_p"
+        --flashinfer64_token_top_ratio "$flashinfer64_token_top_ratio"
+    )
     python "${REPO_ROOT}/wan21_t2v_inference.py" \
         --model_id "$model_id" \
         --seed "$seed" \
@@ -88,6 +99,7 @@ for prompt_idx in $(seq "$start_idx" "$end_idx"); do
         --sparsity "$sparsity" \
         --tile_size "$tile_size" \
         --block_size "$block_size" \
+        --sparse_execution "$sparse_execution" \
         --skip_steps "$skip_steps" \
         --cache_interval "$cache_interval" \
         --sparsity_dcrt "$sparsity_dcrt" \
@@ -97,6 +109,10 @@ for prompt_idx in $(seq "$start_idx" "$end_idx"); do
         --rest_steps "$rest_steps" \
         --skip_steps2 "$skip_steps2" \
         --record_density "$record_density" \
+        --density_csv "${out_file%.mp4}_density.csv" \
+        --record_timing "$record_timing" \
+        --timing_csv "${out_file%.mp4}_timing.csv" \
+        "${flashinfer64_args[@]}" \
         "${block_mask_args[@]}"
 
     echo "Successfully generated video for prompt $prompt_idx"

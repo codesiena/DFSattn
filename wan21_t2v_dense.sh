@@ -28,6 +28,7 @@ width="${WIDTH:-832}"
 num_frames="${NUM_FRAMES:-81}"
 num_inference_steps="${NUM_INFERENCE_STEPS:-50}"
 model_id="${WAN_MODEL_ID:-}"
+record_timing="${RECORD_TIMING:-False}"
 
 if [ -z "$model_id" ]; then
     echo "ERROR: Set WAN_MODEL_ID."
@@ -66,7 +67,9 @@ for prompt_idx in $(seq "$start_idx" "$end_idx"); do
         --prompt_source "T2V_Wan_VBench" \
         --prompt_idx "$prompt_idx" \
         --output_file "$out_file" \
-        --mode "flash"
+        --mode "flash" \
+        --record_timing "$record_timing" \
+        --timing_csv "${out_file%.mp4}_timing.csv"
 
     echo "Successfully generated video for prompt $prompt_idx"
 done
