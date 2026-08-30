@@ -226,3 +226,5 @@ attention 仍然较慢。
 attention 路径不变。后续质量实验应使用相同 prompt/seed 做四组消融：DFS
 block-only、Top-p-only、DFS block + residual Top-k、Top-p + residual Top-k，并
 确认记录中的 `p_mass` 和 `final_density` 后再比较视频质量。
+
+

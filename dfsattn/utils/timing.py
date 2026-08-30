@@ -105,14 +105,16 @@ class AttentionTimingRecorder:
         rows = self.rows()
         detailed_phases = (
             "flashinfer_qkv_permute",
-            "flashinfer_tile_score",
-            "flashinfer_route_select",
-            "flashinfer_plan",
-            "flashinfer_run",
-            "flashinfer_density_accounting",
-            "flashinfer_residual_total",
+            "flashinfer_fine_score",
+            "flashinfer_core_score",
+            "flashinfer_core_select",
             "flashinfer_residual_select",
-            "flashinfer_residual_run",
+            "flashinfer_promotion",
+            "flashinfer_residual_compact",
+            "flashinfer_plan",
+            "flashinfer_core_run",
+            "flashinfer_residual_micro_run",
+            "flashinfer_density_accounting",
             "flashinfer_lse_merge",
             "flashinfer_output_unpermute",
         )

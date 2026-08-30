@@ -57,9 +57,11 @@ class HunyuanVideo_DFSAttn_Processor2_0:
         flashinfer64_top_p=0.25,
         flashinfer64_token_top_k=None,
         flashinfer64_token_top_ratio=0.10,
-        flashinfer64_route_mode="topp_topk",
+        flashinfer64_route_mode="topk_topp",
         flashinfer64_tile_top_ratio=0.25,
         flashinfer64_token_top_p=0.9,
+        flashinfer64_promotion_threshold=24,
+        flashinfer64_route_cache=False,
         attention_debug_dir=None,
         attention_debug_step=-1,
         attention_debug_layers=(0,),
@@ -95,6 +97,8 @@ class HunyuanVideo_DFSAttn_Processor2_0:
         self.flashinfer64_route_mode = flashinfer64_route_mode
         self.flashinfer64_tile_top_ratio = flashinfer64_tile_top_ratio
         self.flashinfer64_token_top_p = flashinfer64_token_top_p
+        self.flashinfer64_promotion_threshold = flashinfer64_promotion_threshold
+        self.flashinfer64_route_cache = flashinfer64_route_cache
         self.attention_debug_dir = attention_debug_dir
         self.attention_debug_step = (
             skip_steps if attention_debug_step < 0 else attention_debug_step
@@ -304,6 +308,8 @@ class HunyuanVideo_DFSAttn_Processor2_0:
                     flashinfer64_route_mode=self.flashinfer64_route_mode,
                     flashinfer64_tile_top_ratio=self.flashinfer64_tile_top_ratio,
                     flashinfer64_token_top_p=self.flashinfer64_token_top_p,
+                    flashinfer64_promotion_threshold=self.flashinfer64_promotion_threshold,
+                    flashinfer64_route_cache=self.flashinfer64_route_cache,
                     flashinfer64_valid_sequence=int(cu_seqlens_q[1].item()),
                 )
             else:

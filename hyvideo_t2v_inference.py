@@ -69,14 +69,16 @@ def parse_args():
     parser.add_argument("--residual_candidate_blocks", type=int, default=4, help="Number of highest-scoring unselected blocks searched by residual token Top-k (default: 4).")
     parser.add_argument("--selector_mode", choices=["topk", "kp"], default="topk", help="Coarse selector: upstream Top-k, or Top-k followed by local sub-block Top-p")
     parser.add_argument("--fine_top_p", type=float, default=0.9, help="Sub-block cumulative mass used by --selector_mode kp (default: 0.9)")
-    parser.add_argument("--sparse_execution", choices=["native", "hybrid", "flashinfer64"], default="native", help="DFS execution backend; flashinfer64 is the independent 64x64 tile Top-p + residual token Top-k backend.")
+    parser.add_argument("--sparse_execution", choices=["native", "hybrid", "flashinfer64"], default="native", help="DFS execution backend; flashinfer64 now uses Q128xK96 Core plus Q16xK16 Residual.")
     parser.add_argument("--hybrid_threshold", type=int, default=8, help="Promote a 4x4 group of active 16x16 blocks to a 64x64 Core tile at this occupancy (1-16).")
-    parser.add_argument("--flashinfer64_top_p", type=float, default=0.25, help="Per-head/per-q64-block cumulative probability mass for the independent FlashInfer64 selector.")
+    parser.add_argument("--flashinfer64_top_p", type=float, default=0.25, help="Per-head/per-Q128 macro cumulative mass sent to FlashInfer.")
     parser.add_argument("--flashinfer64_token_top_k", type=int, default=None, help="Deprecated; FlashInfer64 Top-k is ratio-based. Use --flashinfer64_token_top_ratio.")
-    parser.add_argument("--flashinfer64_token_top_ratio", type=float, default=0.10, help="Residual token fraction in unselected 64x64 tiles for flashinfer64.")
-    parser.add_argument("--flashinfer64_route_mode", choices=["topp_topk", "topk_topp"], default="topp_topk", help="topp_topk: tile Top-p through FlashInfer plus residual token Top-k; topk_topp: tile Top-k through FlashInfer plus residual token Top-p.")
-    parser.add_argument("--flashinfer64_tile_top_ratio", type=float, default=0.25, help="Fraction of 64x64 KV tiles per query tile sent to FlashInfer by Top-k ranking in topk_topp mode.")
-    parser.add_argument("--flashinfer64_token_top_p", type=float, default=0.9, help="Residual token proxy mass evaluated separately in topk_topp mode.")
+    parser.add_argument("--flashinfer64_token_top_ratio", type=float, default=0.10, help="Deprecated compatibility field; the new Residual uses micro Top-p.")
+    parser.add_argument("--flashinfer64_route_mode", choices=["topp_topk", "topk_topp"], default="topk_topp", help="Choose macro Top-p or ratio Top-k for the Q128xK96 FlashInfer Core; topk_topp is the paper path.")
+    parser.add_argument("--flashinfer64_tile_top_ratio", type=float, default=0.25, help="Fraction of K96 macro tiles selected for each head/Q128 in topk_topp mode.")
+    parser.add_argument("--flashinfer64_token_top_p", type=float, default=0.9, help="Target total Q16/K16 proxy mass covered by Core plus Residual; rejected mass is not renormalized.")
+    parser.add_argument("--flashinfer64_promotion_threshold", type=int, default=24, help="Promote a Q128xK96 tile when at least this many of its 48 Q16xK16 microtiles are selected.")
+    parser.add_argument("--flashinfer64_route_cache", type=str2bool, default=False, help="Reuse compact routes across cache intervals. False is the bounded-memory bring-up mode; expanded FlashInfer plans are never cached.")
     parser.add_argument("--order", type=str, default="hilbert3d", choices=["org", "hilbert2d", "blk", "hwf", "fwh","hilbert3d"])
     parser.add_argument("--skip_layers", type=list[int], default=[], help="Layer indices to skip in dfs attention")
     parser.add_argument("--skip_steps", type=int, default=12, help="Number of steps to skip in dfs attention")
@@ -125,6 +127,8 @@ def parse_args():
         parser.error("--flashinfer64_tile_top_ratio must be in (0, 1].")
     if not 0.0 <= args.flashinfer64_token_top_p <= 1.0:
         parser.error("--flashinfer64_token_top_p must be in [0, 1].")
+    if not 1 <= args.flashinfer64_promotion_threshold <= 48:
+        parser.error("--flashinfer64_promotion_threshold must be in [1, 48].")
     if args.selector_mode == "kp" and args.block_top_p is not None:
         parser.error("--selector_mode kp uses coarse Top-k and cannot be combined with --block_top_p.")
     if args.selector_mode == "kp" and args.token_top_k > 0:
@@ -242,6 +246,8 @@ if __name__ == "__main__":
                 args.flashinfer64_route_mode,
                 args.flashinfer64_tile_top_ratio,
                 args.flashinfer64_token_top_p,
+                args.flashinfer64_promotion_threshold,
+                args.flashinfer64_route_cache,
                 args.attention_debug_dir,
                 args.attention_debug_step,
                 args.attention_debug_layers,

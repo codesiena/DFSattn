@@ -286,7 +286,8 @@ Useful script variables:
 - `SPARSITY`, `SKIP_STEPS`, `CACHE_INTERVAL`, `SPARSITY_DCRT`, `TILE_SIZE`, `BLOCK_SIZE`, `ORDER`: DFSAttn parameters.
 - `SELECTOR_MODE`: `topk` (default) or coarse-Top-k/fine-Top-p `kp`.
 - `FINE_TOP_P`: fine cumulative mass for `kp` (default: `0.9`).
-- `SPARSE_EXECUTION=flashinfer64`: independent 64x64 routing. `FLASHINFER64_ROUTE_MODE=topp_topk` sends tile Top-p to FlashInfer and uses ratio-based residual token Top-k (`FLASHINFER64_TOKEN_TOP_RATIO`). `FLASHINFER64_ROUTE_MODE=topk_topp` sends ratio-based tile Top-k (`FLASHINFER64_TILE_TOP_RATIO`) to FlashInfer and evaluates residual token Top-p (`FLASHINFER64_TOKEN_TOP_P`) separately.
+- `SPARSE_EXECUTION=flashinfer64`: hardware-aligned hierarchical routing. The paper path aggregates Q16xK16 fine scores into Q128xK96 macro scores, selects Core by ratio Top-k, and sends it through FlashInfer. Residual searches every non-Core Q16xK16 tile and uses its original, unnormalized mass only to bring Core+Residual coverage up to `FLASHINFER64_TOKEN_TOP_P`. `FLASHINFER64_PROMOTION_THRESHOLD` promotes a macro tile when enough of its 48 microtiles are active.
+- `FLASHINFER64_ROUTE_CACHE=False` (default): rebuild and release the compact route on every sparse call. Set it to `True` only when route reuse is wanted; the expanded FlashInfer plan is still rebuilt every call and is never cached per layer.
 - `HEIGHT`, `WIDTH`, `NUM_FRAMES`, `NUM_INFERENCE_STEPS`, `SEED`: generation settings.
 - `BLOCK_MASK_DIR`: enable top-k mask export; inference creates a `prompt_NNN_<prompt-text>` subdirectory.
 - `BLOCK_MASK_HEADS`: comma-separated heads to render, or `all` (default: `0`).
@@ -304,12 +305,16 @@ Useful script variables:
 | `ORDER` / `--order` | `hilbert3d` | Token ordering strategy. |
 
 The independent `flashinfer64` backend does not reuse the historical
-Hybrid/KP route. It selects full 64x64 tiles independently per head and q64
-block, runs them with FlashInfer's variable block-sparse wrapper, ranks tokens
-inside unselected tiles per query, runs the residual list with the new Triton
-kernel, and merges both normalized states using LSE. It requires CUDA and a
-FlashInfer build exposing `VariableBlockSparseAttentionWrapper`; the CPU path
-in `dfsattn/flashinfer64_attention.py` is only a correctness reference.
+Hybrid/KP route. It scores Q16/K16 interactions, aggregates them into Q128/K96
+macro tiles, sends Core macro tiles to FlashInfer, and runs selected complement
+microtiles with one grouped Triton MMA program per head/Q16. Dense-enough
+residual regions are promoted to Core, and the disjoint states are merged with
+exact LSE normalization. Following SVG's bounded-memory lifecycle, all layers
+share one FlashInfer wrapper and each call replans into it, overwriting the
+previous expanded plan. No layer retains an expanded plan or a full CUDA
+Residual boolean mask. Compact route reuse is optional and is disabled by
+default for initial bring-up. It requires CUDA and a FlashInfer build exposing
+`VariableBlockSparseAttentionWrapper`; the CPU path is a correctness reference.
 
 DFSAttn runs full attention for the first `SKIP_STEPS` diffusion steps. After
 that, it starts from `SPARSITY` and refreshes the sparse mask every

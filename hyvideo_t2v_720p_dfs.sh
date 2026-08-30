@@ -25,9 +25,11 @@ selector_mode="${SELECTOR_MODE:-topk}"
 fine_top_p="${FINE_TOP_P:-0.9}"
 flashinfer64_top_p="${FLASHINFER64_TOP_P:-0.25}"
 flashinfer64_token_top_ratio="${FLASHINFER64_TOKEN_TOP_RATIO:-0.10}"
-flashinfer64_route_mode="${FLASHINFER64_ROUTE_MODE:-topp_topk}"
+flashinfer64_route_mode="${FLASHINFER64_ROUTE_MODE:-topk_topp}"
 flashinfer64_tile_top_ratio="${FLASHINFER64_TILE_TOP_RATIO:-0.25}"
 flashinfer64_token_top_p="${FLASHINFER64_TOKEN_TOP_P:-0.9}"
+flashinfer64_promotion_threshold="${FLASHINFER64_PROMOTION_THRESHOLD:-24}"
+flashinfer64_route_cache="${FLASHINFER64_ROUTE_CACHE:-False}"
 if [ "$selector_mode" = "kp" ]; then
     sparse_execution="${SPARSE_EXECUTION:-hybrid}"
     export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -76,11 +78,11 @@ subblock_profile_dir="${SUBBLOCK_PROFILE_DIR:-}"
 subblock_profile_masses="${SUBBLOCK_PROFILE_MASSES:-0.9}"
 if [ "$sparse_execution" = "flashinfer64" ]; then
     if [ "$flashinfer64_route_mode" = "topk_topp" ]; then
-        flashinfer64_route_tag="tilekratio${flashinfer64_tile_top_ratio}_tokentopp${flashinfer64_token_top_p}"
+        flashinfer64_route_tag="tilekratio${flashinfer64_tile_top_ratio}_totaltopp${flashinfer64_token_top_p}_promote${flashinfer64_promotion_threshold}"
     else
-        flashinfer64_route_tag="topp${flashinfer64_top_p}_topkratio${flashinfer64_token_top_ratio}"
+        flashinfer64_route_tag="topp${flashinfer64_top_p}_totaltopp${flashinfer64_token_top_p}_promote${flashinfer64_promotion_threshold}"
     fi
-    output_dir="${OUTPUT_DIR:-${res_root}/flashinfer64/${dataset_name}/${model_name}/seed${seed}_${flashinfer64_route_tag}_${order}_${height}_cache${cache_interval}}"
+    output_dir="${OUTPUT_DIR:-${res_root}/flashinfer64/${dataset_name}/${model_name}/seed${seed}_${flashinfer64_route_tag}_${order}_${height}_routecache${flashinfer64_route_cache}_cache${cache_interval}}"
 else
     output_dir="${OUTPUT_DIR:-${res_root}/${selector_tag}/${dataset_name}/${model_name}/dfs/ts${tile_size}_${block_size}_seed${seed}_${order}_${height}_cache${cache_interval}}"
 fi
@@ -139,6 +141,8 @@ for prompt_idx in $(seq "$start_idx" "$end_idx"); do
         --flashinfer64_tile_top_ratio "$flashinfer64_tile_top_ratio"
         --flashinfer64_token_top_p "$flashinfer64_token_top_p"
         --flashinfer64_token_top_ratio "$flashinfer64_token_top_ratio"
+        --flashinfer64_promotion_threshold "$flashinfer64_promotion_threshold"
+        --flashinfer64_route_cache "$flashinfer64_route_cache"
     )
     attention_debug_args=()
     if [ -n "$attention_debug_dir" ]; then

@@ -1438,13 +1438,18 @@ class DFS_Attention(nn.Module):
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
             fields = [
                 "p_mass", "fine_top_p", "token_top_k", "token_top_ratio", "residual_candidate_blocks", "block_density", "realized_block_sparsity",
-                "residual_token_interactions", "final_density", "final_hybrid_sparsity",
+                "residual_token_interactions", "residual_micro_tiles",
+                "promoted_macro_tiles", "final_density", "final_hybrid_sparsity",
             ]
             with open(output_path, "w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=["step_idx", "layer_idx", *fields])
                 writer.writeheader()
                 for step, layer, values in flat:
-                    writer.writerow({"step_idx": step, "layer_idx": layer, **values})
+                    writer.writerow({
+                        "step_idx": step,
+                        "layer_idx": layer,
+                        **{field: values.get(field, float("nan")) for field in fields},
+                    })
             logger.info("Phase-A sparsity records saved to {}", output_path)
         return output_path
 
@@ -1488,9 +1493,11 @@ def dfs_attention(
     flashinfer64_top_p: float = 0.25,
     flashinfer64_token_top_k: Optional[int] = None,
     flashinfer64_token_top_ratio: float = 0.10,
-    flashinfer64_route_mode: str = "topp_topk",
+    flashinfer64_route_mode: str = "topk_topp",
     flashinfer64_tile_top_ratio: float = 0.25,
     flashinfer64_token_top_p: float = 0.9,
+    flashinfer64_promotion_threshold: int = 24,
+    flashinfer64_route_cache: bool = False,
     flashinfer64_valid_sequence: Optional[int] = None,
 ) -> torch.Tensor:
     """
@@ -1547,6 +1554,8 @@ def dfs_attention(
             token_top_k=flashinfer64_token_top_k,
             token_top_ratio=flashinfer64_token_top_ratio,
             token_top_p=flashinfer64_token_top_p,
+            promotion_threshold=flashinfer64_promotion_threshold,
+            reuse_route=flashinfer64_route_cache,
             valid_sequence=flashinfer64_valid_sequence,
             refresh_route=cache_flag and is_cache_step,
             record_density=record_density,
@@ -1569,14 +1578,16 @@ def dfs_attention(
             final_density = final_interactions / total_possible
             DFS_Attention.density_records.setdefault(step_idx, {})[layer_idx] = final_density
             DFS_Attention.sparsity_records.setdefault(step_idx, {})[layer_idx] = {
-                "p_mass": float(flashinfer64_top_p) if flashinfer64_route_mode == "topp_topk" else float(flashinfer64_token_top_p),
-                "fine_top_p": float("nan"),
+                "p_mass": float(flashinfer64_top_p) if flashinfer64_route_mode == "topp_topk" else float("nan"),
+                "fine_top_p": float(flashinfer64_token_top_p),
                 "token_top_k": float(-1),
                 "token_top_ratio": float(flashinfer64_tile_top_ratio) if flashinfer64_route_mode == "topk_topp" else float(flashinfer64_token_top_ratio),
                 "residual_candidate_blocks": float("nan"),
                 "block_density": core_density,
                 "realized_block_sparsity": 1.0 - core_density,
                 "residual_token_interactions": float(stats["residual_token_interactions"]),
+                "residual_micro_tiles": float(stats.get("residual_micro_tiles", 0)),
+                "promoted_macro_tiles": float(stats.get("promoted_macro_tiles", 0)),
                 "final_density": final_density,
                 "final_hybrid_sparsity": 1.0 - final_density,
             }
