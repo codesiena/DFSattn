@@ -40,6 +40,7 @@ MICRO = 16
 Q_MICROS_PER_MACRO = Q_MACRO // MICRO
 K_MICROS_PER_MACRO = K_MACRO // MICRO
 BLOCK_SIZE = Q_MACRO  # historical compatibility only
+RESIDUAL_BUCKET_CAPS = (4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
 
 # SVG's bounded-memory lifecycle: layers execute sequentially, so one wrapper
 # and one expanded plan are enough for the whole model.  Every plan overwrites
@@ -53,7 +54,9 @@ _shared_core_signature = None
 class FlashInfer64Route:
     core_mask: torch.Tensor          # [H, ceil(S/128), ceil(S/96)]
     residual_mask: Optional[torch.Tensor]  # CPU reference only; never retained on CUDA
-    residual_indices: torch.Tensor   # [H, ceil(S/16), max_selected_K16]
+    residual_indices: torch.Tensor   # CSR column indices [nnz]
+    residual_indptr: torch.Tensor    # CSR row pointers [H*ceil(S/16)+1]
+    residual_buckets: Tuple[Tuple[int, torch.Tensor], ...]  # (capacity, CSR row ids)
     sequence: int
     video_len: int
     route_mode: str
@@ -65,6 +68,11 @@ class FlashInfer64Route:
     core_interactions: int
     residual_interactions: int
     residual_micro_tiles: int
+    residual_count_mean: float
+    residual_count_p50: float
+    residual_count_p95: float
+    residual_count_max: float
+    residual_count_nonempty_ratio: float
 
 
 def _timing_start(recorder: Any, device: torch.device) -> Any:
@@ -250,17 +258,48 @@ def _promote_residual_microtiles(residual, core_mask, *, promotion_threshold):
     return core_mask, residual, promoted_tiles
 
 
-def _compact_residual_mask(residual):
-    """Pack variable K16 lists for the grouped Residual kernel."""
+def _build_residual_csr(residual, *, collect_stats: bool = True):
+    """Pack Q16/K16 support into CSR and group non-empty rows by length.
+
+    The old layout padded every row to the global maximum selected-K16 count.
+    CSR stores each selected K16 exactly once, while length buckets bound the
+    remaining per-kernel padding to a small local range.
+    """
     heads, q_micro, k_micro = residual.shape
-    max_count = int(residual.sum(-1).max().item()) if residual.numel() else 0
-    if max_count:
-        key_ids = torch.arange(k_micro, device=residual.device, dtype=torch.int32)
-        sortable = torch.where(residual, key_ids[None, None], k_micro)
-        compact = torch.sort(sortable, dim=-1, stable=True).values[..., :max_count].contiguous()
+    flat = residual.reshape(heads * q_micro, k_micro)
+    counts = flat.sum(-1, dtype=torch.int32)
+    indptr = torch.empty(
+        counts.numel() + 1, device=residual.device, dtype=torch.int32
+    )
+    indptr[0] = 0
+    torch.cumsum(counts, dim=0, out=indptr[1:])
+    key_ids = torch.arange(k_micro, device=residual.device, dtype=torch.int32)
+    indices = key_ids.expand(flat.shape[0], -1).masked_select(flat).contiguous()
+
+    caps = list(RESIDUAL_BUCKET_CAPS)
+    while caps[-1] < k_micro:
+        caps.append(caps[-1] * 2)
+    all_rows = torch.arange(counts.numel(), device=residual.device, dtype=torch.int32)
+    buckets = []
+    lower = 0
+    for cap in caps:
+        row_ids = all_rows.masked_select((counts > lower) & (counts <= cap))
+        if row_ids.numel():
+            buckets.append((cap, row_ids.contiguous()))
+        lower = cap
+
+    if collect_stats and counts.numel():
+        count_float = counts.float()
+        p50, p95 = torch.quantile(
+            count_float, torch.tensor((0.50, 0.95), device=residual.device)
+        ).tolist()
+        count_mean = float(count_float.mean().item())
+        count_max = float(counts.max().item())
+        nonempty_ratio = float((counts > 0).float().mean().item())
     else:
-        compact = torch.empty((heads, q_micro, 0), device=residual.device, dtype=torch.int32)
-    return compact
+        count_mean = p50 = p95 = count_max = nonempty_ratio = float("nan")
+    stats = (count_mean, float(p50), float(p95), count_max, nonempty_ratio)
+    return indices, indptr, tuple(buckets), stats
 
 
 def _count_route_interactions(core_mask, residual_mask, sequence):
@@ -350,17 +389,21 @@ def _prepare_flashinfer_vector_workspace(
 if triton is not None:
     @triton.jit
     def _residual_micro_attention_kernel(
-        q_ptr, k_ptr, v_ptr, index_ptr, out_ptr, lse_ptr,
+        q_ptr, k_ptr, v_ptr, index_ptr, indptr_ptr, row_ids_ptr, out_ptr, lse_ptr,
         sequence, q_micro_blocks, k_micro_blocks,
         stride_qh, stride_qs, stride_kh, stride_ks, stride_vh, stride_vs,
-        stride_ih, stride_iq, stride_ik, stride_oh, stride_os,
+        stride_oh, stride_os,
         head_dim: tl.constexpr, block_d: tl.constexpr,
-        max_k_tiles: tl.constexpr, micro_size: tl.constexpr,
+        bucket_capacity: tl.constexpr, micro_size: tl.constexpr,
         scale: tl.constexpr,
     ):
-        """One grouped MMA program per (head,Q16), looping compact K16 tiles."""
+        """One grouped MMA program per non-empty CSR row in one length bucket."""
         pid = tl.program_id(0)
-        head, qb = pid // q_micro_blocks, pid % q_micro_blocks
+        csr_row = tl.load(row_ids_ptr + pid)
+        head, qb = csr_row // q_micro_blocks, csr_row % q_micro_blocks
+        row_start = tl.load(indptr_ptr + csr_row)
+        row_end = tl.load(indptr_ptr + csr_row + 1)
+        row_count = row_end - row_start
         rows = tl.arange(0, micro_size)
         cols = tl.arange(0, micro_size)
         dims = tl.arange(0, block_d)
@@ -373,10 +416,11 @@ if triton is not None:
         m = tl.full((micro_size,), float("-inf"), tl.float32)
         l = tl.zeros((micro_size,), tl.float32)
         acc = tl.zeros((micro_size, block_d), tl.float32)
-        for slot in range(0, max_k_tiles):
-            kb = tl.load(index_ptr + head * stride_ih + qb * stride_iq + slot * stride_ik)
+        for slot in range(0, bucket_capacity):
+            slot_valid = slot < row_count
+            kb = tl.load(index_ptr + row_start + slot, mask=slot_valid, other=k_micro_blocks)
             k_pos = kb * micro_size + cols
-            k_valid = (kb < k_micro_blocks) & (k_pos < sequence)
+            k_valid = slot_valid & (kb < k_micro_blocks) & (k_pos < sequence)
             kt = tl.load(
                 k_ptr + head * stride_kh + k_pos[None, :] * stride_ks + dims[:, None],
                 mask=k_valid[None, :] & (dims[:, None] < head_dim), other=0.0,
@@ -405,10 +449,10 @@ if triton is not None:
         tl.store(lse_ptr + head * sequence + q_pos, row_lse, mask=q_valid)
 
 
-def _run_residual_micro(q, k, v, route):
+def _run_residual_micro(q, k, v, route, recorder=None, step=-1, layer=-1):
     heads, sequence, dim = q.shape
-    indices, max_tiles = route.residual_indices, route.residual_indices.shape[-1]
-    if max_tiles == 0:
+    indices = route.residual_indices
+    if indices.numel() == 0:
         return torch.zeros_like(q), torch.full(
             (heads, sequence), float("-inf"), device=q.device, dtype=torch.float32
         )
@@ -422,15 +466,25 @@ def _run_residual_micro(q, k, v, route):
         weights = torch.softmax(torch.where(valid, scores, torch.zeros_like(scores)), -1)
         weights = torch.where(mask, weights, torch.zeros_like(weights))
         return torch.bmm(weights.to(v.dtype), v), lse
-    output, lse = torch.empty_like(q), torch.empty((heads, sequence), device=q.device, dtype=torch.float32)
-    _residual_micro_attention_kernel[(heads * indices.shape[1],)](
-        q, k, v, indices, output, lse,
-        sequence, indices.shape[1], _ceil_div(sequence, MICRO),
-        q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1),
-        indices.stride(0), indices.stride(1), indices.stride(2), output.stride(0), output.stride(1),
-        head_dim=dim, block_d=triton.next_power_of_2(dim), max_k_tiles=max_tiles,
-        micro_size=MICRO, scale=dim ** -0.5, num_warps=4,
-    )
+    q_micro_blocks = _ceil_div(sequence, MICRO)
+    output = torch.zeros_like(q)
+    lse = torch.full((heads, sequence), float("-inf"), device=q.device, dtype=torch.float32)
+    for bucket_capacity, row_ids in route.residual_buckets:
+        bucket_start = _timing_start(recorder, q.device)
+        _residual_micro_attention_kernel[(row_ids.numel(),)](
+            q, k, v, indices, route.residual_indptr, row_ids, output, lse,
+            sequence, q_micro_blocks, _ceil_div(sequence, MICRO),
+            q.stride(0), q.stride(1), k.stride(0), k.stride(1),
+            v.stride(0), v.stride(1), output.stride(0), output.stride(1),
+            head_dim=dim, block_d=triton.next_power_of_2(dim),
+            bucket_capacity=bucket_capacity, micro_size=MICRO,
+            scale=dim ** -0.5, num_warps=4,
+        )
+        _timing_stop(
+            recorder, bucket_start,
+            f"flashinfer_residual_bucket_le{bucket_capacity}",
+            step, layer, q.device,
+        )
     return output, lse
 
 
@@ -565,7 +619,12 @@ class FlashInfer64Attention:
             _timing_stop(timing_recorder, promotion_start, "flashinfer_promotion", step_idx, layer_idx, q.device)
 
             compact_start = _timing_start(timing_recorder, q.device)
-            indices = _compact_residual_mask(residual)
+            collect_route_stats = record_density or bool(
+                timing_recorder is not None and getattr(timing_recorder, "enabled", False)
+            )
+            indices, indptr, buckets, residual_count_stats = _build_residual_csr(
+                residual, collect_stats=collect_route_stats,
+            )
             core_n, residual_n, residual_tiles = _count_route_interactions(
                 core, residual, sequence
             )
@@ -574,17 +633,26 @@ class FlashInfer64Attention:
             # full bool matrix would cost about 180MB per layer at 480p.
             residual_mask_for_route = residual if not q.is_cuda else None
             self.route = FlashInfer64Route(
-                core, residual_mask_for_route, indices,
+                core, residual_mask_for_route, indices, indptr, buckets,
                 sequence, -1 if video_len is None else video_len,
                 route_mode, tile_top_p, tile_top_ratio, token_top_p,
                 promotion_threshold, promoted,
                 core_n, residual_n, residual_tiles,
+                *residual_count_stats,
             )
             del micro_scores, macro_scores, residual
 
         route = self.route
         if route is None:
             raise RuntimeError("failed to build hierarchical route")
+        if timing_recorder is not None:
+            timing_recorder.record_metrics({
+                "residual_count_mean": route.residual_count_mean,
+                "residual_count_p50": route.residual_count_p50,
+                "residual_count_p95": route.residual_count_p95,
+                "residual_count_max": route.residual_count_max,
+                "residual_count_nonempty_ratio": route.residual_count_nonempty_ratio,
+            })
         # Like SVG, plan is intentionally ephemeral and overwrites the prior
         # layer's expanded token indices.  Compact route reuse does not imply
         # expanded-plan reuse.
@@ -597,7 +665,9 @@ class FlashInfer64Attention:
             timing_recorder, step_idx, layer_idx,
         )
         residual_start = _timing_start(timing_recorder, q.device)
-        residual_output, residual_lse = _run_residual_micro(qh, kh, vh, route)
+        residual_output, residual_lse = _run_residual_micro(
+            qh, kh, vh, route, timing_recorder, step_idx, layer_idx,
+        )
         _timing_stop(timing_recorder, residual_start, "flashinfer_residual_micro_run", step_idx, layer_idx, q.device)
         merge_start = _timing_start(timing_recorder, q.device)
         merged = _merge_lse_states(core_output, core_lse, residual_output, residual_lse)
@@ -612,6 +682,11 @@ class FlashInfer64Attention:
                 "residual_token_interactions": route.residual_interactions,
                 "residual_micro_tiles": route.residual_micro_tiles,
                 "promoted_macro_tiles": route.promoted_tiles,
+                "residual_count_mean": route.residual_count_mean,
+                "residual_count_p50": route.residual_count_p50,
+                "residual_count_p95": route.residual_count_p95,
+                "residual_count_max": route.residual_count_max,
+                "residual_count_nonempty_ratio": route.residual_count_nonempty_ratio,
                 "total_possible": qh.shape[0] * (sequence * sequence + padding * padding),
             }
         _timing_stop(

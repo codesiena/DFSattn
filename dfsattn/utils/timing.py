@@ -33,10 +33,19 @@ class AttentionTimingRecorder:
     def __init__(self, enabled: bool = False) -> None:
         self.enabled = enabled
         self._records: List[_EventPair] = []
+        self._metric_records: Dict[str, List[float]] = {}
 
     def reset(self, enabled: bool) -> None:
         self.enabled = enabled
         self._records.clear()
+        self._metric_records.clear()
+
+    def record_metrics(self, metrics: Dict[str, float]) -> None:
+        """Record non-timing route statistics for the aggregate timing CSV."""
+        if not self.enabled:
+            return
+        for name, value in metrics.items():
+            self._metric_records.setdefault(name, []).append(float(value))
 
     def start(self, device: torch.device) -> Optional[Union[torch.cuda.Event, float]]:
         if not self.enabled:
@@ -135,6 +144,10 @@ class AttentionTimingRecorder:
             phase = aliases.get(raw_phase)
             if phase is None and raw_phase in detailed_phases:
                 phase = raw_phase
+            if phase is None and raw_phase.startswith("flashinfer_residual_bucket_le"):
+                phase = raw_phase
+                phase_totals.setdefault(phase, 0.0)
+                phase_calls.setdefault(phase, 0.0)
             if phase is None:
                 continue
             phase_totals[phase] += float(row["elapsed_ms"])
@@ -146,9 +159,14 @@ class AttentionTimingRecorder:
                 phase_calls[phase] = 1.0
 
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        metric_fields = (
+            "residual_count_mean", "residual_count_p50", "residual_count_p95",
+            "residual_count_max", "residual_count_nonempty_ratio",
+        )
         with open(output_path, "w", newline="") as handle:
             writer = csv.DictWriter(
-                handle, fieldnames=["phase", "total_ms", "calls", "mean_ms"]
+                handle,
+                fieldnames=["phase", "total_ms", "calls", "mean_ms", *metric_fields],
             )
             writer.writeheader()
             for phase, total_ms in phase_totals.items():
@@ -161,6 +179,21 @@ class AttentionTimingRecorder:
                         "mean_ms": total_ms / calls if calls else 0.0,
                     }
                 )
+            metric_values = {
+                name: self._metric_records.get(name, []) for name in metric_fields
+            }
+            metric_calls = max((len(values) for values in metric_values.values()), default=0)
+            if metric_calls:
+                writer.writerow({
+                    "phase": "residual_route_stats",
+                    "total_ms": "",
+                    "calls": metric_calls,
+                    "mean_ms": "",
+                    **{
+                        name: sum(values) / len(values) if values else float("nan")
+                        for name, values in metric_values.items()
+                    },
+                })
 
         summary: Dict[str, Dict[str, float]] = {}
         for phase, total_ms in phase_totals.items():

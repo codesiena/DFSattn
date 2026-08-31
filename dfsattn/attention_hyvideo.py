@@ -1321,7 +1321,8 @@ class DFS_Attention(nn.Module):
     def dump_density_records(cls, output_path: Optional[str] = None) -> Optional[str]:
         """Print recorded densities and optionally save them to a CSV file.
 
-        CSV columns: step_idx, layer_idx, density (fraction of kept blocks).
+        CSV includes density plus Residual CSR row-length statistics when the
+        hierarchical FlashInfer backend supplied them.
         """
         records = cls.density_records
         if not records:
@@ -1338,21 +1339,42 @@ class DFS_Attention(nn.Module):
         print(header)
         print("-" * len(header))
         step_sums: Dict[int, float] = {}
+        step_counts: Dict[int, int] = {}
         for step, layer, density in flat:
             step_sums[step] = step_sums.get(step, 0.0) + density
+            step_counts[step] = step_counts.get(step, 0) + 1
             print(f"{step:>9} {layer:>10} {density:>9.4f} {density * 100:>9.2f}")
         all_mean = sum(d for _, _, d in flat) / len(flat)
         print(f"\nMean density over all layers/steps: {all_mean:.4f} ({all_mean * 100:.2f}%)")
-        step_mean = sum(step_sums.values()) / len(step_sums)
+        step_mean = sum(
+            step_sums[step] / step_counts[step]
+            for step in step_sums
+        ) / len(step_sums)
         print(f"Mean density per step (averaged over layers): {step_mean:.4f} ({step_mean * 100:.2f}%)")
         print("================================================")
 
         if output_path is not None:
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
             with open(output_path, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(["step_idx", "layer_idx", "density"])
-                writer.writerows(flat)
+                metric_fields = [
+                    "residual_count_mean", "residual_count_p50", "residual_count_p95",
+                    "residual_count_max", "residual_count_nonempty_ratio",
+                ]
+                writer = csv.DictWriter(
+                    f, fieldnames=["step_idx", "layer_idx", "density", *metric_fields]
+                )
+                writer.writeheader()
+                for step, layer, density in flat:
+                    sparse = cls.sparsity_records.get(step, {}).get(layer, {})
+                    writer.writerow({
+                        "step_idx": step,
+                        "layer_idx": layer,
+                        "density": density,
+                        **{
+                            field: sparse.get(field, float("nan"))
+                            for field in metric_fields
+                        },
+                    })
             print(f"Density records saved to: {output_path}")
         return output_path
 
@@ -1380,15 +1402,36 @@ class DFS_Attention(nn.Module):
             for step in sorted(records)
             if records[step]
         ]
+        mean_density_per_step_averaged_over_layers = sum(step_means) / len(step_means)
         summary = {
             "prompt_idx": "" if prompt_idx is None else prompt_idx,
             "prompt": "" if prompt is None else prompt,
             "mean_density_over_sparse_step_layer_records": sum(values) / len(values),
-            "mean_density_per_sparse_step": sum(step_means) / len(step_means),
+            # Keep the original field name for compatibility with existing
+            # analysis scripts, and expose the printed metric explicitly.
+            "mean_density_per_sparse_step": mean_density_per_step_averaged_over_layers,
+            "mean_density_per_step_averaged_over_layers": mean_density_per_step_averaged_over_layers,
             "num_sparse_step_layer_records": len(values),
             "num_sparse_steps": len(step_means),
             "num_layers_with_records": len({layer for step in records.values() for layer in step}),
         }
+        route_metrics = (
+            "residual_count_mean", "residual_count_p50", "residual_count_p95",
+            "residual_count_max", "residual_count_nonempty_ratio",
+        )
+        sparse_values = [
+            values
+            for step in sorted(cls.sparsity_records)
+            for values in cls.sparsity_records[step].values()
+        ]
+        for metric in route_metrics:
+            metric_values = [
+                float(values[metric]) for values in sparse_values
+                if metric in values and math.isfinite(float(values[metric]))
+            ]
+            summary[f"mean_{metric}"] = (
+                sum(metric_values) / len(metric_values) if metric_values else float("nan")
+            )
         if output_path is not None:
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
             fieldnames = list(summary.keys())
@@ -1407,8 +1450,11 @@ class DFS_Attention(nn.Module):
                             name: legacy_values.get(name, "")
                             for name in fieldnames
                         })
-                    elif existing_fieldnames == fieldnames:
-                        existing_rows = list(reader)
+                    elif set(existing_fieldnames).issubset(fieldnames):
+                        existing_rows = [
+                            {name: row.get(name, "") for name in fieldnames}
+                            for row in reader
+                        ]
                     else:
                         raise ValueError(
                             f"Unexpected density summary schema in {output_path}: "
@@ -1439,7 +1485,10 @@ class DFS_Attention(nn.Module):
             fields = [
                 "p_mass", "fine_top_p", "token_top_k", "token_top_ratio", "residual_candidate_blocks", "block_density", "realized_block_sparsity",
                 "residual_token_interactions", "residual_micro_tiles",
-                "promoted_macro_tiles", "final_density", "final_hybrid_sparsity",
+                "promoted_macro_tiles",
+                "residual_count_mean", "residual_count_p50", "residual_count_p95",
+                "residual_count_max", "residual_count_nonempty_ratio",
+                "final_density", "final_hybrid_sparsity",
             ]
             with open(output_path, "w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=["step_idx", "layer_idx", *fields])
@@ -1588,6 +1637,11 @@ def dfs_attention(
                 "residual_token_interactions": float(stats["residual_token_interactions"]),
                 "residual_micro_tiles": float(stats.get("residual_micro_tiles", 0)),
                 "promoted_macro_tiles": float(stats.get("promoted_macro_tiles", 0)),
+                "residual_count_mean": float(stats.get("residual_count_mean", float("nan"))),
+                "residual_count_p50": float(stats.get("residual_count_p50", float("nan"))),
+                "residual_count_p95": float(stats.get("residual_count_p95", float("nan"))),
+                "residual_count_max": float(stats.get("residual_count_max", float("nan"))),
+                "residual_count_nonempty_ratio": float(stats.get("residual_count_nonempty_ratio", float("nan"))),
                 "final_density": final_density,
                 "final_hybrid_sparsity": 1.0 - final_density,
             }

@@ -118,19 +118,20 @@ Core mask 的形状为：
 
 ### 3.2 Residual：Q16×K16 grouped Triton/MMA
 
-Residual bool mask 会先压缩为：
+Residual bool mask 会先压缩成真正的 CSR：
 
 ```text
-[head, ceil(S/16), max_selected_K16]
+indices : 所有被选 K16 block 编号的连续一维数组
+indptr  : 每个 (head,Q16) 行在 indices 中的起止位置
 ```
 
-其中保存每个 head、每个 Q16 query block 对应的 K16 block 编号。CUDA 上不再保留原始三维 bool mask。
+CUDA 上不再保留原始三维 bool mask，也不再把所有行 padding 到全局最大 Residual 长度。非空 CSR 行按照实际 K16 数量进入 `≤4/8/16/32/64/...` 的 length buckets。
 
 Triton kernel 的执行方式为：
 
-- 一个 program 对应一个 `(head, Q16 block)`。
+- 一个 program 对应当前 bucket 中的一个非空 `(head, Q16 block)`；空行不启动 program。
 - program 将该 Q16 block 的 query 载入一次。
-- 循环其 compact K16 列表，逐块执行 `16×d` 与 `d×16` 的 QK MMA。
+- 循环其 CSR K16 列表，逐块执行 `16×d` 与 `d×16` 的 QK MMA；桶内 padding 有固定小上界，不受全局异常长行影响。
 - 采用 online softmax，持续更新行最大值、指数和以及 value accumulator。
 - 最终输出 `(O_res, LSE_res)`。
 
@@ -183,11 +184,12 @@ O   = (w_c O_c + w_r O_r) / (w_c + w_r)
 | `flashinfer_residual_compact` | Residual bool mask 压缩及 interaction 统计 |
 | `flashinfer_plan` | FlashInfer mask 展开与 plan |
 | `flashinfer_core_run` | FlashInfer Core kernel |
-| `flashinfer_residual_micro_run` | grouped Triton Residual kernel |
+| `flashinfer_residual_micro_run` | 全部 length-bucket Triton Residual kernels |
+| `flashinfer_residual_bucket_leN` | Residual 长度不超过 N 的单桶 kernel；与上一总阶段嵌套，不应重复求和 |
 | `flashinfer_lse_merge` | exact LSE merge |
 | `flashinfer_output_unpermute` | 恢复原 token 顺序 |
 
-同时记录 Core token interactions、Residual token interactions、Residual microtile 数、promotion macro 数、最终 density 和 sparsity。实验分析时应将“选择与 plan 开销”和“两类 kernel 的实际运行时间”分开，避免只用总稀疏率推断加速效果。
+同时记录 Core token interactions、Residual token interactions、Residual microtile 数、promotion macro 数、最终 density 和 sparsity。`timing.csv` 的 `residual_route_stats` 行以及逐层 `sparsity_records.csv` 还记录 `residual_count_mean/p50/p95/max/nonempty_ratio`，用于判断 Residual 长尾和空行比例。实验分析时应将“选择与 plan 开销”和“两类 kernel 的实际运行时间”分开，避免只用总稀疏率推断加速效果。
 
 ## 6. 方法定位
 

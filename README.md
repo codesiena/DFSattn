@@ -306,8 +306,9 @@ Useful script variables:
 
 The independent `flashinfer64` backend does not reuse the historical
 Hybrid/KP route. It scores Q16/K16 interactions, aggregates them into Q128/K96
-macro tiles, sends Core macro tiles to FlashInfer, and runs selected complement
-microtiles with one grouped Triton MMA program per head/Q16. Dense-enough
+macro tiles, sends Core macro tiles to FlashInfer, and packs selected complement
+microtiles into CSR length buckets for grouped Triton MMA. Empty Q16 rows are
+not launched and no row is padded to the global Residual maximum. Dense-enough
 residual regions are promoted to Core, and the disjoint states are merged with
 exact LSE normalization. Following SVG's bounded-memory lifecycle, all layers
 share one FlashInfer wrapper and each call replans into it, overwriting the

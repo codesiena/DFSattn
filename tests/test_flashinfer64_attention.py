@@ -8,7 +8,7 @@ from dfsattn.flashinfer64_attention import (
     K_MACRO,
     MICRO,
     Q_MACRO,
-    _compact_residual_mask,
+    _build_residual_csr,
     _ensure_flashinfer_vector_workspace,
     _promote_residual_microtiles,
     _select_residual_to_total_mass,
@@ -205,11 +205,35 @@ class FlashInfer64AttentionTest(unittest.TestCase):
             core,
             promotion_threshold=24,
         )
-        compact = _compact_residual_mask(residual)
+        indices, indptr, buckets, stats = _build_residual_csr(residual)
         self.assertTrue(bool(core.all()))
         self.assertFalse(bool(residual.any()))
-        self.assertEqual(compact.shape[-1], 0)
+        self.assertEqual(indices.numel(), 0)
+        self.assertEqual(indptr.tolist(), [0] * (residual.shape[0] * residual.shape[1] + 1))
+        self.assertEqual(buckets, ())
+        self.assertEqual(stats[0], 0.0)
         self.assertEqual(promoted, 1)
+
+    def test_residual_csr_and_length_buckets_preserve_mask(self) -> None:
+        residual = torch.zeros((2, 3, 10), dtype=torch.bool)
+        residual[0, 0, [1, 7]] = True
+        residual[0, 2, [0, 2, 4, 6, 8]] = True
+        residual[1, 1, [3]] = True
+        indices, indptr, buckets, stats = _build_residual_csr(residual)
+
+        rebuilt = torch.zeros_like(residual).view(6, 10)
+        for row in range(6):
+            cols = indices[indptr[row] : indptr[row + 1]].long()
+            rebuilt[row, cols] = True
+        torch.testing.assert_close(rebuilt.view_as(residual), residual)
+        self.assertEqual([cap for cap, _ in buckets], [4, 8])
+        bucket_rows = {cap: rows.tolist() for cap, rows in buckets}
+        self.assertEqual(bucket_rows[4], [0, 4])
+        self.assertEqual(bucket_rows[8], [2])
+        self.assertAlmostEqual(stats[0], 8.0 / 6.0)
+        self.assertEqual(stats[1], 0.5)
+        self.assertEqual(stats[3], 5.0)
+        self.assertAlmostEqual(stats[4], 0.5)
 
     def test_residual_uses_absolute_mass_without_renormalizing_complement(self) -> None:
         # Core covers 0.70 original mass.  A total target of 0.80 requires only
