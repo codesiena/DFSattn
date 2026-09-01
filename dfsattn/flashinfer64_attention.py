@@ -3,8 +3,7 @@
 The historical module/backend name is retained for CLI compatibility.  The
 implementation is now Q128xK96 FlashInfer Core plus Q16xK16 grouped Triton
 Residual, with macro Top-k/Top-p, global complement micro Top-p, occupancy promotion,
-exact LSE merge, optional compact-route reuse, and one model-wide ephemeral
-FlashInfer plan.
+exact LSE merge, optional compact-route reuse, and cached per-layer FA3 plans.
 """
 
 from __future__ import annotations
@@ -27,6 +26,23 @@ except Exception:  # pragma: no cover
     FlashInferVariableBlockSparseAttention = None
 
 try:
+    from flashinfer.page import block_sparse_indices_to_vector_sparse_offsets
+    from flashinfer.prefill import get_batch_prefill_module
+    from flashinfer.utils import (
+        MaskMode,
+        PosEncodingMode,
+        TensorLayout,
+        determine_attention_backend,
+        device_support_pdl,
+    )
+except Exception:  # pragma: no cover - private API varies across FlashInfer releases
+    block_sparse_indices_to_vector_sparse_offsets = None
+    get_batch_prefill_module = None
+    MaskMode = PosEncodingMode = TensorLayout = None
+    determine_attention_backend = None
+    device_support_pdl = None
+
+try:
     import triton
     import triton.language as tl
 except ImportError:  # pragma: no cover
@@ -42,12 +58,14 @@ K_MICROS_PER_MACRO = K_MACRO // MICRO
 BLOCK_SIZE = Q_MACRO  # historical compatibility only
 RESIDUAL_BUCKET_CAPS = (4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
 
-# SVG's bounded-memory lifecycle: layers execute sequentially, so one wrapper
-# and one expanded plan are enough for the whole model.  Every plan overwrites
-# the previous layer's plan instead of being retained by 60 backend instances.
+# The compatibility VariableBlock path keeps one model-wide ephemeral wrapper.
+# The direct FA3 path instead stores one compact scheduler plan per layer so a
+# route cached for 12 denoising steps also avoids 11 repeated plan calls.
 _shared_core_wrapper: Any = None
 _shared_core_workspace: Optional[torch.Tensor] = None
 _shared_core_signature = None
+_shared_direct_vector_indices: Optional[torch.Tensor] = None
+_shared_direct_pin_workspace: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -57,6 +75,7 @@ class FlashInfer64Route:
     residual_indices: torch.Tensor   # CSR column indices [nnz]
     residual_indptr: torch.Tensor    # CSR row pointers [H*ceil(S/16)+1]
     residual_buckets: Tuple[Tuple[int, torch.Tensor], ...]  # (capacity, CSR row ids)
+    residual_active_rows: torch.Tensor  # flattened (head, Q16) CSR rows with non-zero residual
     sequence: int
     video_len: int
     route_mode: str
@@ -64,6 +83,7 @@ class FlashInfer64Route:
     tile_top_ratio: float
     token_top_p: float
     promotion_threshold: int
+    core_only: bool
     promoted_tiles: int
     core_interactions: int
     residual_interactions: int
@@ -345,16 +365,22 @@ def _ensure_flashinfer_vector_workspace(wrapper: Any) -> None:
     vector_indptr = getattr(wrapper, "_vector_sparse_indptr_buffer", None)
     if any(x is None for x in (indices, indptr, vector_indices, vector_indptr)):
         raise RuntimeError("installed FlashInfer FA3 wrapper lacks vector sparse workspaces")
+    changed = False
     if vector_indices.numel() <= indices.numel():
         vector_indices = torch.empty(indices.numel() + 1, dtype=torch.int32, device=indices.device)
+        changed = True
     if vector_indptr.numel() <= indptr.numel():
         vector_indptr = torch.empty(indptr.numel() + 1, dtype=torch.int32, device=indptr.device)
-    wrapper.reset_workspace_buffer(
-        float_workspace_buffer=wrapper._float_workspace_buffer,
-        int_workspace_buffer=wrapper._int_workspace_buffer,
-        vector_sparse_indices_buffer=vector_indices,
-        vector_sparse_indptr_buffer=vector_indptr,
-    )
+        changed = True
+    # reset_workspace_buffer also allocates a new pinned 8MB host buffer.  Do
+    # not pay that cost on every layer-call when the existing buffers fit.
+    if changed:
+        wrapper.reset_workspace_buffer(
+            float_workspace_buffer=wrapper._float_workspace_buffer,
+            int_workspace_buffer=wrapper._int_workspace_buffer,
+            vector_sparse_indices_buffer=vector_indices,
+            vector_sparse_indptr_buffer=vector_indptr,
+        )
 
 
 def _prepare_flashinfer_vector_workspace(
@@ -372,25 +398,264 @@ def _prepare_flashinfer_vector_workspace(
     """
     required_indices = int((core_mask.to(torch.int64) * col_sizes[:, None]).sum().item()) + 1
     required_indptr = core_mask.shape[0] * core_mask.shape[1] + 2
-    vector_indices = torch.empty(
-        required_indices, dtype=torch.int32, device=core_mask.device
-    )
-    vector_indptr = torch.empty(
-        required_indptr, dtype=torch.int32, device=core_mask.device
-    )
-    wrapper.reset_workspace_buffer(
-        float_workspace_buffer=wrapper._float_workspace_buffer,
-        int_workspace_buffer=wrapper._int_workspace_buffer,
-        vector_sparse_indices_buffer=vector_indices,
-        vector_sparse_indptr_buffer=vector_indptr,
-    )
+    vector_indices = getattr(wrapper, "_vector_sparse_indices_buffer", None)
+    vector_indptr = getattr(wrapper, "_vector_sparse_indptr_buffer", None)
+    changed = False
+    if vector_indices is None or vector_indices.numel() < required_indices:
+        vector_indices = torch.empty(
+            required_indices, dtype=torch.int32, device=core_mask.device
+        )
+        changed = True
+    if vector_indptr is None or vector_indptr.numel() < required_indptr:
+        vector_indptr = torch.empty(
+            required_indptr, dtype=torch.int32, device=core_mask.device
+        )
+        changed = True
+    # The first compact plan intentionally replaces FlashInfer's 512MB default
+    # vector buffer.  Later plans reuse the largest capacity seen so far.
+    if changed or vector_indices.numel() >= 128 * 1024 * 1024:
+        if vector_indices.numel() >= 128 * 1024 * 1024:
+            vector_indices = torch.empty(
+                required_indices, dtype=torch.int32, device=core_mask.device
+            )
+        wrapper.reset_workspace_buffer(
+            float_workspace_buffer=wrapper._float_workspace_buffer,
+            int_workspace_buffer=wrapper._int_workspace_buffer,
+            vector_sparse_indices_buffer=vector_indices,
+            vector_sparse_indptr_buffer=vector_indptr,
+        )
+
+
+def _direct_macro_csr_available(q: torch.Tensor) -> bool:
+    """Whether the installed FlashInfer can run the SM90 macro-CSR fast path."""
+    if not q.is_cuda or any(
+        item is None
+        for item in (
+            block_sparse_indices_to_vector_sparse_offsets,
+            get_batch_prefill_module,
+            determine_attention_backend,
+        )
+    ):
+        return False
+    try:
+        backend = determine_attention_backend(
+            q.device,
+            PosEncodingMode.NONE.value,
+            False,  # use_fp16_qk_reduction
+            False,  # use_custom_mask
+            q.dtype,
+            q.dtype,
+        )
+        return backend == "fa3"
+    except Exception:
+        # Private FlashInfer APIs have changed across releases.  Falling back
+        # to VariableBlock is slower but preserves compatibility.
+        return False
+
+
+def _ensure_shared_direct_vector_workspace(required: int, device: torch.device) -> torch.Tensor:
+    global _shared_direct_vector_indices
+    # Hopper's sparse gather may issue a full CTA_KV access at the end.  Keep
+    # one extra native K96 tile, even though predicates discard the tail.
+    required = required + K_MACRO
+    if (
+        _shared_direct_vector_indices is None
+        or _shared_direct_vector_indices.device != device
+        or _shared_direct_vector_indices.numel() < required
+    ):
+        _shared_direct_vector_indices = torch.empty(
+            required, dtype=torch.int32, device=device
+        )
+    return _shared_direct_vector_indices
+
+
+class _DirectMacroCSRPlan:
+    """Cached per-layer FA3 plan backed by compact K96 macro CSR.
+
+    VariableBlockSparseAttentionWrapper expands every selected macro into 96
+    token indices and rebuilds the scheduler on every call.  This plan keeps
+    only K96 base offsets.  Expansion is a small CUDA kernel at ``run`` time,
+    while the expensive SM90 scheduler plan is rebuilt only when the route is
+    refreshed.
+    """
+
+    def __init__(self, float_workspace: torch.Tensor, q: torch.Tensor):
+        global _shared_direct_pin_workspace
+        plan_workspace_mb = int(os.environ.get("FLASHINFER64_PLAN_WORKSPACE_MB", "8"))
+        if plan_workspace_mb < 1:
+            raise ValueError("FLASHINFER64_PLAN_WORKSPACE_MB must be at least 1")
+        self.float_workspace = float_workspace
+        self.int_workspace = torch.empty(
+            plan_workspace_mb * 1024 * 1024, dtype=torch.uint8, device=q.device
+        )
+        if (
+            _shared_direct_pin_workspace is None
+            or _shared_direct_pin_workspace.numel() < self.int_workspace.numel()
+        ):
+            _shared_direct_pin_workspace = torch.empty(
+                self.int_workspace.numel(), dtype=torch.uint8,
+                device="cpu", pin_memory=True,
+            )
+        self.pin_workspace = _shared_direct_pin_workspace
+        self.route_identity: Any = None
+        self.module = None
+        self.plan_info = None
+
+    def plan(self, q: torch.Tensor, core_mask: torch.Tensor, route_identity: Any) -> None:
+        heads, sequence, dim = q.shape
+        q_blocks, k_blocks = core_mask.shape[1:]
+
+        counts = core_mask.sum(-1, dtype=torch.int32).reshape(-1)
+        macro_indptr = torch.empty(
+            counts.numel() + 1, dtype=torch.int32, device=q.device
+        )
+        macro_indptr[0] = 0
+        torch.cumsum(counts, 0, out=macro_indptr[1:])
+        selected = core_mask.nonzero(as_tuple=False)
+        # Store token-base offsets rather than token-expanded indices.  Rows are
+        # ordered (head, Q128, K96), so a partial final K96 block is always the
+        # final item of that CSR row and fixed-96 expansion remains valid.
+        macro_bases = (
+            selected[:, 0].to(torch.int64) * sequence
+            + selected[:, 2].to(torch.int64) * K_MACRO
+        ).to(torch.int32).contiguous()
+
+        col_sizes = torch.full(
+            (k_blocks,), K_MACRO, dtype=torch.int32, device=q.device
+        )
+        col_sizes[-1] = sequence - (k_blocks - 1) * K_MACRO
+        kv_lens = (
+            core_mask.to(torch.int32) * col_sizes[None, None, :]
+        ).sum(-1, dtype=torch.int32).reshape(-1).contiguous()
+        vector_indptr = torch.empty(
+            kv_lens.numel() + 1, dtype=torch.int32, device=q.device
+        )
+        vector_indptr[0] = 0
+        torch.cumsum(kv_lens, 0, out=vector_indptr[1:])
+
+        q_sizes = torch.full(
+            (heads, q_blocks), Q_MACRO, dtype=torch.int32, device=q.device
+        )
+        q_sizes[:, -1] = sequence - (q_blocks - 1) * Q_MACRO
+        qo_indptr = torch.empty(
+            q_sizes.numel() + 1, dtype=torch.int32, device=q.device
+        )
+        qo_indptr[0] = 0
+        torch.cumsum(q_sizes.reshape(-1), 0, out=qo_indptr[1:])
+        last_page_len = torch.ones_like(kv_lens)
+
+        qo_indptr_host = qo_indptr.to("cpu")
+        vector_indptr_host = vector_indptr.to("cpu")
+        kv_lens_host = kv_lens.to("cpu")
+        required_vector = int(vector_indptr_host[-1].item())
+        _ensure_shared_direct_vector_workspace(required_vector, q.device)
+
+        self.module = get_batch_prefill_module(
+            "fa3", q.dtype, q.dtype, q.dtype, torch.int32,
+            dim, dim, PosEncodingMode.NONE.value,
+            False,  # use_sliding_window
+            False,  # use_logits_soft_cap
+            False,  # use_fp16_qk_reduction
+        )
+        self.plan_info = self.module.plan(
+            self.float_workspace,
+            self.int_workspace,
+            self.pin_workspace,
+            qo_indptr_host,
+            vector_indptr_host,
+            kv_lens_host,
+            heads * sequence,
+            heads * q_blocks,
+            1,  # each logical head is represented as one independent batch
+            1,
+            1,  # vector-sparse page size
+            False,
+            dim,
+            dim,
+            False,
+        )
+        self.qo_indptr = qo_indptr
+        self.macro_indptr = macro_indptr
+        self.macro_bases = macro_bases
+        self.vector_indptr = vector_indptr
+        self.kv_lens = kv_lens
+        self.last_page_len = last_page_len
+        self.required_vector = required_vector
+        self.route_identity = route_identity
+
+    def run(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, return_lse: bool,
+        recorder=None, step=-1, layer=-1,
+    ):
+        if self.module is None or self.plan_info is None:
+            raise RuntimeError("direct macro-CSR plan has not been initialized")
+        heads, sequence, dim = q.shape
+        vector_indices = _ensure_shared_direct_vector_workspace(
+            self.required_vector, q.device
+        )
+        expand_start = _timing_start(recorder, q.device)
+        block_sparse_indices_to_vector_sparse_offsets(
+            self.macro_bases,
+            self.macro_indptr,
+            vector_indices,
+            self.vector_indptr,
+            self.kv_lens,
+            1,  # macro_bases already contain absolute token offsets
+            1,
+            K_MACRO,
+        )
+        _timing_stop(
+            recorder, expand_start, "flashinfer_core_csr_expand",
+            step, layer, q.device,
+        )
+        q_flat = q.reshape(heads * sequence, 1, dim)
+        k_flat = k.reshape(heads * sequence, 1, 1, dim)
+        v_flat = v.reshape(heads * sequence, 1, 1, dim)
+        output = torch.empty_like(q_flat)
+        lse = torch.empty(
+            (heads * sequence, 1), dtype=torch.float32, device=q.device
+        ) if return_lse else None
+        enable_pdl = device_support_pdl(q.device) if device_support_pdl is not None else False
+        self.module.paged_run(
+            self.float_workspace,
+            self.int_workspace,
+            self.plan_info,
+            q_flat,
+            k_flat,
+            v_flat,
+            self.qo_indptr,
+            self.vector_indptr,
+            vector_indices,
+            self.last_page_len,
+            output,
+            lse,
+            MaskMode.NON_CAUSAL.value,
+            TensorLayout.NHD.value,
+            -1,
+            enable_pdl,
+            None,  # packed custom mask
+            None,  # mask indptr
+            None,  # alibi slopes
+            None,  # maybe_prefix_len_ptr
+            None,  # maybe_token_pos_in_items_ptr
+            None,  # maybe_max_item_len_ptr
+            0.0,  # logits_soft_cap
+            dim ** -0.5,
+            None, None, None,  # fp8 scales
+            1.0, 1.0e4,  # rope scale/theta (unused with NONE)
+            0,  # token_pos_in_items_len
+        )
+        output = output.reshape(heads, sequence, dim)
+        if not return_lse:
+            return output
+        return output, lse.reshape(heads, sequence)
 
 
 if triton is not None:
     @triton.jit
     def _residual_micro_attention_kernel(
         q_ptr, k_ptr, v_ptr, index_ptr, indptr_ptr, row_ids_ptr, out_ptr, lse_ptr,
-        sequence, q_micro_blocks, k_micro_blocks,
+        sequence, q_micro_blocks, k_micro_blocks, active_offset,
         stride_qh, stride_qs, stride_kh, stride_ks, stride_vh, stride_vs,
         stride_oh, stride_os,
         head_dim: tl.constexpr, block_d: tl.constexpr,
@@ -441,12 +706,52 @@ if triton is not None:
             acc += tl.dot(weights.to(vv.dtype), vv)
             m = new_m
         output = acc / tl.maximum(l[:, None], 1.0e-20)
+        active_row = active_offset + pid
         tl.store(
-            out_ptr + head * stride_oh + q_pos[:, None] * stride_os + dims[None, :], output,
+            out_ptr + active_row * stride_oh + rows[:, None] * stride_os + dims[None, :], output,
             mask=q_valid[:, None] & (dims[None, :] < head_dim),
         )
         row_lse = tl.where(l > 0, m + tl.log(l), float("-inf"))
-        tl.store(lse_ptr + head * sequence + q_pos, row_lse, mask=q_valid)
+        tl.store(lse_ptr + active_row * micro_size + rows, row_lse, mask=q_valid)
+
+    @triton.jit
+    def _merge_lse_active_rows_kernel(
+        core_out_ptr, core_lse_ptr, residual_out_ptr, residual_lse_ptr,
+        active_rows_ptr, sequence, q_micro_blocks,
+        stride_oh, stride_os, stride_roh, stride_ros,
+        head_dim: tl.constexpr, block_d: tl.constexpr,
+        micro_size: tl.constexpr,
+    ):
+        """Merge only Q16 rows which actually contain Residual support."""
+        pid = tl.program_id(0)
+        csr_row = tl.load(active_rows_ptr + pid)
+        head, qb = csr_row // q_micro_blocks, csr_row % q_micro_blocks
+        rows = tl.arange(0, micro_size)
+        dims = tl.arange(0, block_d)
+        q_pos = qb * micro_size + rows
+        valid = q_pos < sequence
+        flat = head * sequence + q_pos
+        core_lse = tl.load(core_lse_ptr + flat, mask=valid, other=float("-inf"))
+        residual_lse = tl.load(
+            residual_lse_ptr + pid * micro_size + rows,
+            mask=valid, other=float("-inf"),
+        )
+        m = tl.maximum(core_lse, residual_lse)
+        wc = tl.where(core_lse != float("-inf"), tl.exp(core_lse - m), 0.0)
+        wr = tl.where(residual_lse != float("-inf"), tl.exp(residual_lse - m), 0.0)
+        z = tl.maximum(wc + wr, 1.0e-20)
+        offsets = head * stride_oh + q_pos[:, None] * stride_os + dims[None, :]
+        mask = valid[:, None] & (dims[None, :] < head_dim)
+        core = tl.load(core_out_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        residual = tl.load(
+            residual_out_ptr
+            + pid * stride_roh + rows[:, None] * stride_ros + dims[None, :],
+            mask=valid[:, None] & (dims[None, :] < head_dim), other=0.0,
+        ).to(tl.float32)
+        merged = (wc[:, None] * core + wr[:, None] * residual) / z[:, None]
+        # Core output is dead after the merge, so update it in place and avoid
+        # allocating/copying a full [H,S,D] output tensor.
+        tl.store(core_out_ptr + offsets, merged, mask=mask)
 
 
 def _run_residual_micro(q, k, v, route, recorder=None, step=-1, layer=-1):
@@ -467,13 +772,21 @@ def _run_residual_micro(q, k, v, route, recorder=None, step=-1, layer=-1):
         weights = torch.where(mask, weights, torch.zeros_like(weights))
         return torch.bmm(weights.to(v.dtype), v), lse
     q_micro_blocks = _ceil_div(sequence, MICRO)
-    output = torch.zeros_like(q)
-    lse = torch.full((heads, sequence), float("-inf"), device=q.device, dtype=torch.float32)
+    active_count = route.residual_active_rows.numel()
+    # Compact outputs avoid memset/write traffic for empty Q16 rows.  The
+    # active-row ordering is exactly the concatenated bucket ordering below.
+    output = torch.empty(
+        (active_count, MICRO, dim), dtype=q.dtype, device=q.device
+    )
+    lse = torch.empty(
+        (active_count, MICRO), dtype=torch.float32, device=q.device
+    )
+    active_offset = 0
     for bucket_capacity, row_ids in route.residual_buckets:
         bucket_start = _timing_start(recorder, q.device)
         _residual_micro_attention_kernel[(row_ids.numel(),)](
             q, k, v, indices, route.residual_indptr, row_ids, output, lse,
-            sequence, q_micro_blocks, _ceil_div(sequence, MICRO),
+            sequence, q_micro_blocks, _ceil_div(sequence, MICRO), active_offset,
             q.stride(0), q.stride(1), k.stride(0), k.stride(1),
             v.stride(0), v.stride(1), output.stride(0), output.stride(1),
             head_dim=dim, block_d=triton.next_power_of_2(dim),
@@ -485,6 +798,7 @@ def _run_residual_micro(q, k, v, route, recorder=None, step=-1, layer=-1):
             f"flashinfer_residual_bucket_le{bucket_capacity}",
             step, layer, q.device,
         )
+        active_offset += row_ids.numel()
     return output, lse
 
 
@@ -496,32 +810,81 @@ def _merge_lse_states(core_output, core_lse, residual_output, residual_lse):
     return (wc[..., None] * core_output.float() + wr[..., None] * residual_output.float()) / z[..., None]
 
 
+def _merge_lse_active_rows(
+    core_output, core_lse, residual_output, residual_lse, route,
+):
+    """Exact in-place LSE merge restricted to non-empty Residual Q16 rows."""
+    active_rows = route.residual_active_rows
+    if active_rows.numel() == 0:
+        return core_output
+    if triton is None or not core_output.is_cuda:
+        merged = _merge_lse_states(
+            core_output, core_lse, residual_output, residual_lse
+        ).to(core_output.dtype)
+        q_micro_blocks = _ceil_div(core_output.shape[1], MICRO)
+        row_mask = torch.zeros(
+            core_output.shape[0] * q_micro_blocks,
+            dtype=torch.bool, device=core_output.device,
+        )
+        row_mask[active_rows.long()] = True
+        token_mask = row_mask.view(core_output.shape[0], q_micro_blocks).repeat_interleave(
+            MICRO, dim=1
+        )[:, :core_output.shape[1]]
+        return torch.where(token_mask[..., None], merged, core_output)
+    if residual_output.ndim != 3 or residual_output.shape[1] != MICRO:
+        raise RuntimeError("CUDA Residual output must use compact active-row layout")
+    _merge_lse_active_rows_kernel[(active_rows.numel(),)](
+        core_output, core_lse, residual_output, residual_lse,
+        active_rows, core_output.shape[1], _ceil_div(core_output.shape[1], MICRO),
+        core_output.stride(0), core_output.stride(1),
+        residual_output.stride(0), residual_output.stride(1),
+        head_dim=core_output.shape[2],
+        block_d=triton.next_power_of_2(core_output.shape[2]),
+        micro_size=MICRO,
+        num_warps=4,
+    )
+    return core_output
+
+
 class FlashInfer64Attention:
     """Per-layer compact route; expanded FlashInfer plan is model-wide."""
 
     def __init__(self):
         self.route: Optional[FlashInfer64Route] = None
         self.last_stats = None
+        self._direct_core_plan: Optional[_DirectMacroCSRPlan] = None
 
-    def _plan_core(self, q, core_mask):
+    def _plan_core(self, q, core_mask, *, route_identity=None, direct_macro_csr=True):
         global _shared_core_wrapper, _shared_core_workspace, _shared_core_signature
         if not q.is_cuda:
-            return None
+            return None, False
         if flashinfer is None or FlashInferVariableBlockSparseAttention is None:
             raise ImportError("hierarchical backend requires FlashInfer")
         heads, sequence, dim = q.shape
         signature = (q.device.index, q.dtype, heads, sequence, dim)
-        if _shared_core_wrapper is None or _shared_core_signature != signature:
+        if _shared_core_workspace is None or _shared_core_signature != signature:
             workspace_mb = int(os.environ.get("FLASHINFER64_WORKSPACE_MB", "128"))
             if workspace_mb < 16:
                 raise ValueError("FLASHINFER64_WORKSPACE_MB must be at least 16")
             _shared_core_workspace = torch.empty(
                 workspace_mb * 1024 * 1024, device=q.device, dtype=torch.uint8
             )
+            _shared_core_wrapper = None
+            _shared_core_signature = signature
+        if direct_macro_csr and _direct_macro_csr_available(q):
+            if (
+                self._direct_core_plan is None
+                or self._direct_core_plan.float_workspace is not _shared_core_workspace
+            ):
+                self._direct_core_plan = _DirectMacroCSRPlan(_shared_core_workspace, q)
+            if self._direct_core_plan.route_identity is not route_identity:
+                self._direct_core_plan.plan(q, core_mask, route_identity)
+                return self._direct_core_plan, True
+            return self._direct_core_plan, False
+        if _shared_core_wrapper is None:
             _shared_core_wrapper = FlashInferVariableBlockSparseAttention(
                 _shared_core_workspace, backend="auto"
             )
-            _shared_core_signature = signature
         q_blocks, k_blocks = core_mask.shape[1:]
         row_sizes = torch.full((heads, q_blocks), Q_MACRO, device=q.device, dtype=torch.int32)
         col_sizes = torch.full((heads, k_blocks), K_MACRO, device=q.device, dtype=torch.int32)
@@ -534,7 +897,7 @@ class FlashInfer64Attention:
             q_data_type=q.dtype, kv_data_type=q.dtype,
         )
         _ensure_flashinfer_vector_workspace(_shared_core_wrapper)
-        return _shared_core_wrapper
+        return _shared_core_wrapper, True
 
     def _run_core(self, q, k, v, route, wrapper, recorder, step, layer):
         start = _timing_start(recorder, q.device)
@@ -548,7 +911,13 @@ class FlashInfer64Attention:
         else:
             if wrapper is None:
                 raise RuntimeError("shared FlashInfer plan is missing")
-            output, lse = wrapper.run(q, k, v, return_lse=True)
+            if isinstance(wrapper, _DirectMacroCSRPlan):
+                output, lse = wrapper.run(
+                    q, k, v, return_lse=True,
+                    recorder=recorder, step=step, layer=layer,
+                )
+            else:
+                output, lse = wrapper.run(q, k, v, return_lse=True)
             lse = lse * math.log(2.0)
         _timing_stop(recorder, start, "flashinfer_core_run", step, layer, q.device)
         return output, lse
@@ -560,6 +929,8 @@ class FlashInfer64Attention:
         token_top_k: Optional[int], token_top_ratio: float, token_top_p: float = 0.9,
         promotion_threshold: int = 24,
         reuse_route: bool = False,
+        core_only: bool = False,
+        direct_macro_csr: bool = True,
         valid_sequence: Optional[int] = None, refresh_route: bool,
         record_density: bool = False, timing_recorder: Any = None,
         step_idx: int = -1, layer_idx: int = -1,
@@ -588,6 +959,7 @@ class FlashInfer64Attention:
             and self.route.route_mode == route_mode and self.route.top_p == tile_top_p
             and self.route.tile_top_ratio == tile_top_ratio and self.route.token_top_p == token_top_p
             and self.route.promotion_threshold == promotion_threshold
+            and self.route.core_only == core_only
             and self.route.core_mask.device == q.device
         )
         if refresh_route or not route_valid:
@@ -606,37 +978,52 @@ class FlashInfer64Attention:
             )
             _timing_stop(timing_recorder, core_select_start, "flashinfer_core_select", step_idx, layer_idx, q.device)
 
-            residual_select_start = _timing_start(timing_recorder, q.device)
-            residual = _select_residual_to_total_mass(
-                micro_scores, core, total_top_p=token_top_p,
-            )
-            _timing_stop(timing_recorder, residual_select_start, "flashinfer_residual_select", step_idx, layer_idx, q.device)
+            if core_only:
+                residual = torch.zeros_like(micro_scores, dtype=torch.bool)
+                promoted = 0
+                indices = torch.empty(0, dtype=torch.int32, device=q.device)
+                indptr = torch.zeros(
+                    residual.shape[0] * residual.shape[1] + 1,
+                    dtype=torch.int32, device=q.device,
+                )
+                buckets = ()
+                active_rows = torch.empty(0, dtype=torch.int32, device=q.device)
+                residual_count_stats = (0.0, 0.0, 0.0, 0.0, 0.0)
+            else:
+                residual_select_start = _timing_start(timing_recorder, q.device)
+                residual = _select_residual_to_total_mass(
+                    micro_scores, core, total_top_p=token_top_p,
+                )
+                _timing_stop(timing_recorder, residual_select_start, "flashinfer_residual_select", step_idx, layer_idx, q.device)
 
-            promotion_start = _timing_start(timing_recorder, q.device)
-            core, residual, promoted = _promote_residual_microtiles(
-                residual, core, promotion_threshold=promotion_threshold,
-            )
-            _timing_stop(timing_recorder, promotion_start, "flashinfer_promotion", step_idx, layer_idx, q.device)
+                promotion_start = _timing_start(timing_recorder, q.device)
+                core, residual, promoted = _promote_residual_microtiles(
+                    residual, core, promotion_threshold=promotion_threshold,
+                )
+                _timing_stop(timing_recorder, promotion_start, "flashinfer_promotion", step_idx, layer_idx, q.device)
 
-            compact_start = _timing_start(timing_recorder, q.device)
-            collect_route_stats = record_density or bool(
-                timing_recorder is not None and getattr(timing_recorder, "enabled", False)
-            )
-            indices, indptr, buckets, residual_count_stats = _build_residual_csr(
-                residual, collect_stats=collect_route_stats,
-            )
+                compact_start = _timing_start(timing_recorder, q.device)
+                collect_route_stats = record_density or bool(
+                    timing_recorder is not None and getattr(timing_recorder, "enabled", False)
+                )
+                indices, indptr, buckets, residual_count_stats = _build_residual_csr(
+                    residual, collect_stats=collect_route_stats,
+                )
+                active_rows = torch.cat(
+                    tuple(rows for _, rows in buckets), dim=0
+                ) if buckets else torch.empty(0, dtype=torch.int32, device=q.device)
+                _timing_stop(timing_recorder, compact_start, "flashinfer_residual_compact", step_idx, layer_idx, q.device)
             core_n, residual_n, residual_tiles = _count_route_interactions(
                 core, residual, sequence
             )
-            _timing_stop(timing_recorder, compact_start, "flashinfer_residual_compact", step_idx, layer_idx, q.device)
             # CUDA execution consumes only the compact K16 lists.  Keeping the
             # full bool matrix would cost about 180MB per layer at 480p.
             residual_mask_for_route = residual if not q.is_cuda else None
             self.route = FlashInfer64Route(
-                core, residual_mask_for_route, indices, indptr, buckets,
+                core, residual_mask_for_route, indices, indptr, buckets, active_rows,
                 sequence, -1 if video_len is None else video_len,
                 route_mode, tile_top_p, tile_top_ratio, token_top_p,
-                promotion_threshold, promoted,
+                promotion_threshold, core_only, promoted,
                 core_n, residual_n, residual_tiles,
                 *residual_count_stats,
             )
@@ -653,25 +1040,41 @@ class FlashInfer64Attention:
                 "residual_count_max": route.residual_count_max,
                 "residual_count_nonempty_ratio": route.residual_count_nonempty_ratio,
             })
-        # Like SVG, plan is intentionally ephemeral and overwrites the prior
-        # layer's expanded token indices.  Compact route reuse does not imply
-        # expanded-plan reuse.
-        plan_start = _timing_start(timing_recorder, q.device)
-        wrapper = self._plan_core(qh, route.core_mask)
-        _timing_stop(timing_recorder, plan_start, "flashinfer_plan", step_idx, layer_idx, q.device)
+        # On FA3, each layer retains its compact scheduler plan and cache12
+        # skips the next 11 plan calls.  The VariableBlock compatibility path
+        # remains ephemeral and is replanned because its expanded buffers are
+        # shared model-wide.
+        direct_hit = bool(
+            qh.is_cuda and direct_macro_csr and self._direct_core_plan is not None
+            and self._direct_core_plan.route_identity is route
+        )
+        if direct_hit:
+            wrapper = self._direct_core_plan
+        else:
+            plan_start = _timing_start(timing_recorder, q.device)
+            wrapper, _ = self._plan_core(
+                qh, route.core_mask, route_identity=route,
+                direct_macro_csr=direct_macro_csr,
+            )
+            _timing_stop(timing_recorder, plan_start, "flashinfer_plan", step_idx, layer_idx, q.device)
 
         core_output, core_lse = self._run_core(
             qh, kh, vh, route, wrapper,
             timing_recorder, step_idx, layer_idx,
         )
-        residual_start = _timing_start(timing_recorder, q.device)
-        residual_output, residual_lse = _run_residual_micro(
-            qh, kh, vh, route, timing_recorder, step_idx, layer_idx,
-        )
-        _timing_stop(timing_recorder, residual_start, "flashinfer_residual_micro_run", step_idx, layer_idx, q.device)
-        merge_start = _timing_start(timing_recorder, q.device)
-        merged = _merge_lse_states(core_output, core_lse, residual_output, residual_lse)
-        _timing_stop(timing_recorder, merge_start, "flashinfer_lse_merge", step_idx, layer_idx, q.device)
+        if route.residual_indices.numel() == 0:
+            merged = core_output
+        else:
+            residual_start = _timing_start(timing_recorder, q.device)
+            residual_output, residual_lse = _run_residual_micro(
+                qh, kh, vh, route, timing_recorder, step_idx, layer_idx,
+            )
+            _timing_stop(timing_recorder, residual_start, "flashinfer_residual_micro_run", step_idx, layer_idx, q.device)
+            merge_start = _timing_start(timing_recorder, q.device)
+            merged = _merge_lse_active_rows(
+                core_output, core_lse, residual_output, residual_lse, route,
+            )
+            _timing_stop(timing_recorder, merge_start, "flashinfer_lse_merge", step_idx, layer_idx, q.device)
 
         density_start = _timing_start(timing_recorder, q.device)
         if record_density:
@@ -698,6 +1101,10 @@ class FlashInfer64Attention:
         _timing_stop(timing_recorder, output_start, "flashinfer_output_unpermute", step_idx, layer_idx, q.device)
         if not reuse_route:
             self.route = None
+            if self._direct_core_plan is not None:
+                # Do not keep the full route alive solely through the cache
+                # identity when the caller selected bounded-memory mode.
+                self._direct_core_plan.route_identity = None
         return output
 
 

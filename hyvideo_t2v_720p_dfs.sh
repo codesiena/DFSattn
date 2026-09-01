@@ -30,6 +30,8 @@ flashinfer64_tile_top_ratio="${FLASHINFER64_TILE_TOP_RATIO:-0.25}"
 flashinfer64_token_top_p="${FLASHINFER64_TOKEN_TOP_P:-0.9}"
 flashinfer64_promotion_threshold="${FLASHINFER64_PROMOTION_THRESHOLD:-24}"
 flashinfer64_route_cache="${FLASHINFER64_ROUTE_CACHE:-False}"
+flashinfer64_core_only="${FLASHINFER64_CORE_ONLY:-False}"
+flashinfer64_direct_macro_csr="${FLASHINFER64_DIRECT_MACRO_CSR:-True}"
 if [ "$selector_mode" = "kp" ]; then
     sparse_execution="${SPARSE_EXECUTION:-hybrid}"
     export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -82,7 +84,7 @@ if [ "$sparse_execution" = "flashinfer64" ]; then
     else
         flashinfer64_route_tag="topp${flashinfer64_top_p}_totaltopp${flashinfer64_token_top_p}_promote${flashinfer64_promotion_threshold}"
     fi
-    output_dir="${OUTPUT_DIR:-${res_root}/flashinfer64/${dataset_name}/${model_name}/seed${seed}_${flashinfer64_route_tag}_${order}_${height}_routecache${flashinfer64_route_cache}_cache${cache_interval}}"
+    output_dir="${OUTPUT_DIR:-${res_root}/flashinfer64/${dataset_name}/${model_name}/seed${seed}_${flashinfer64_route_tag}_${order}_${height}_routecache${flashinfer64_route_cache}_coreonly${flashinfer64_core_only}_directcsr${flashinfer64_direct_macro_csr}_cache${cache_interval}}"
 else
     output_dir="${OUTPUT_DIR:-${res_root}/${selector_tag}/${dataset_name}/${model_name}/dfs/ts${tile_size}_${block_size}_seed${seed}_${order}_${height}_cache${cache_interval}}"
 fi
@@ -143,6 +145,8 @@ for prompt_idx in $(seq "$start_idx" "$end_idx"); do
         --flashinfer64_token_top_ratio "$flashinfer64_token_top_ratio"
         --flashinfer64_promotion_threshold "$flashinfer64_promotion_threshold"
         --flashinfer64_route_cache "$flashinfer64_route_cache"
+        --flashinfer64_core_only "$flashinfer64_core_only"
+        --flashinfer64_direct_macro_csr "$flashinfer64_direct_macro_csr"
     )
     attention_debug_args=()
     if [ -n "$attention_debug_dir" ]; then

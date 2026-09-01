@@ -1385,7 +1385,13 @@ class DFS_Attention(nn.Module):
         prompt_idx: Optional[int] = None,
         prompt: Optional[str] = None,
     ) -> Optional[str]:
-        """Append one prompt's averages over its sparse step/layer density values.
+        """Append one prompt's density averaged over sparse steps and layers.
+
+        ``mean_final_density_sparse_steps_avg_over_layers`` is the canonical
+        density for experiment comparisons.  For each sparse denoising step we
+        average the final selected QK density over its recorded layers, then
+        average those step means.  Dense warmup steps are not recorded and
+        therefore cannot affect this number.
 
         The summary is intentionally one row per prompt so a multi-prompt shell
         sweep can append to the same CSV without overwriting earlier prompts.
@@ -1402,15 +1408,24 @@ class DFS_Attention(nn.Module):
             for step in sorted(records)
             if records[step]
         ]
-        mean_density_per_step_averaged_over_layers = sum(step_means) / len(step_means)
+        mean_final_density_sparse_steps_avg_over_layers = sum(step_means) / len(step_means)
         summary = {
             "prompt_idx": "" if prompt_idx is None else prompt_idx,
             "prompt": "" if prompt is None else prompt,
+            "density_definition": (
+                "final_selected_qk / all_qk; "
+                "mean_over_sparse_steps_of_mean_over_recorded_layers"
+            ),
+            # Canonical, unambiguous comparison value.  In particular, this
+            # is not the sum over layers (which would be 60x larger here).
+            "mean_final_density_sparse_steps_avg_over_layers": (
+                mean_final_density_sparse_steps_avg_over_layers
+            ),
             "mean_density_over_sparse_step_layer_records": sum(values) / len(values),
             # Keep the original field name for compatibility with existing
             # analysis scripts, and expose the printed metric explicitly.
-            "mean_density_per_sparse_step": mean_density_per_step_averaged_over_layers,
-            "mean_density_per_step_averaged_over_layers": mean_density_per_step_averaged_over_layers,
+            "mean_density_per_sparse_step": mean_final_density_sparse_steps_avg_over_layers,
+            "mean_density_per_step_averaged_over_layers": mean_final_density_sparse_steps_avg_over_layers,
             "num_sparse_step_layer_records": len(values),
             "num_sparse_steps": len(step_means),
             "num_layers_with_records": len({layer for step in records.values() for layer in step}),
@@ -1547,6 +1562,8 @@ def dfs_attention(
     flashinfer64_token_top_p: float = 0.9,
     flashinfer64_promotion_threshold: int = 24,
     flashinfer64_route_cache: bool = False,
+    flashinfer64_core_only: bool = False,
+    flashinfer64_direct_macro_csr: bool = True,
     flashinfer64_valid_sequence: Optional[int] = None,
 ) -> torch.Tensor:
     """
@@ -1605,6 +1622,8 @@ def dfs_attention(
             token_top_p=flashinfer64_token_top_p,
             promotion_threshold=flashinfer64_promotion_threshold,
             reuse_route=flashinfer64_route_cache,
+            core_only=flashinfer64_core_only,
+            direct_macro_csr=flashinfer64_direct_macro_csr,
             valid_sequence=flashinfer64_valid_sequence,
             refresh_route=cache_flag and is_cache_step,
             record_density=record_density,

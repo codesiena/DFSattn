@@ -78,7 +78,9 @@ def parse_args():
     parser.add_argument("--flashinfer64_tile_top_ratio", type=float, default=0.25, help="Fraction of K96 macro tiles selected for each head/Q128 in topk_topp mode.")
     parser.add_argument("--flashinfer64_token_top_p", type=float, default=0.9, help="Target total Q16/K16 proxy mass covered by Core plus Residual; rejected mass is not renormalized.")
     parser.add_argument("--flashinfer64_promotion_threshold", type=int, default=24, help="Promote a Q128xK96 tile when at least this many of its 48 Q16xK16 microtiles are selected.")
-    parser.add_argument("--flashinfer64_route_cache", type=str2bool, default=False, help="Reuse compact routes across cache intervals. False is the bounded-memory bring-up mode; expanded FlashInfer plans are never cached.")
+    parser.add_argument("--flashinfer64_route_cache", type=str2bool, default=False, help="Reuse compact routes across cache intervals. With direct macro CSR this also reuses each layer's FA3 scheduler plan; False rebuilds routes/plans in bounded-memory mode.")
+    parser.add_argument("--flashinfer64_core_only", type=str2bool, default=False, help="Ablation: run only macro Q128xK96 Core and skip Residual/promotion/LSE merge.")
+    parser.add_argument("--flashinfer64_direct_macro_csr", type=str2bool, default=True, help="Cache a compact per-layer macro-CSR FA3 plan and bypass repeated VariableBlock token expansion/planning.")
     parser.add_argument("--order", type=str, default="hilbert3d", choices=["org", "hilbert2d", "blk", "hwf", "fwh","hilbert3d"])
     parser.add_argument("--skip_layers", type=list[int], default=[], help="Layer indices to skip in dfs attention")
     parser.add_argument("--skip_steps", type=int, default=12, help="Number of steps to skip in dfs attention")
@@ -248,6 +250,8 @@ if __name__ == "__main__":
                 args.flashinfer64_token_top_p,
                 args.flashinfer64_promotion_threshold,
                 args.flashinfer64_route_cache,
+                args.flashinfer64_core_only,
+                args.flashinfer64_direct_macro_csr,
                 args.attention_debug_dir,
                 args.attention_debug_step,
                 args.attention_debug_layers,

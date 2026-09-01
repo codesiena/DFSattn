@@ -121,6 +121,7 @@ class AttentionTimingRecorder:
             "flashinfer_promotion",
             "flashinfer_residual_compact",
             "flashinfer_plan",
+            "flashinfer_core_csr_expand",
             "flashinfer_core_run",
             "flashinfer_residual_micro_run",
             "flashinfer_density_accounting",

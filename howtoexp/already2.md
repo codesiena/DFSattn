@@ -8,7 +8,7 @@
 - **Residual**：以 `Q16 × K16` 为单位补充 Core 没覆盖但质量较高的细粒度区域，交给 grouped Triton/MMA kernel。
 - **Merge**：两个分支分别计算输出和 LSE，最后用 exact LSE merge 得到与二者并集完全等价的 softmax 结果。
 
-这样做的目的，是让规则的大块利用 FlashInfer 的高吞吐，同时用较小的 microtile 避免大块选择造成的精度损失。这里的 `Q128 × K96` 是传给 FlashInfer 的**逻辑稀疏块尺寸**；FlashInfer 内部实际采用多少 CTA、warp 以及如何切分，由其 SM90 kernel 自行决定，不能简单等同为一个物理 CTA。
+这样做的目的，是让规则的大块利用 FlashInfer 的高吞吐，同时用较小的 microtile 避免大块选择造成的精度损失。在当前 H100、head dimension 128、FA3 paged-prefill 路径中，FlashInfer SM90 kernel 的原生工作块就是 `CTA_Q=128, CTA_KV=96`；因此上层 Core 的 `Q128 × K96` 与该物理工作块对齐。序列最后不足 96 的 K 尾块仍由 predication 处理。
 
 整体数据流如下：
 
@@ -92,7 +92,7 @@ Promotion 的作用是避免 Triton 分支在局部已经很密集时仍逐个�
 
 ## 3. 底层执行
 
-### 3.1 Core：FlashInfer variable block-sparse attention
+### 3.1 Core：直接 macro-CSR FA3 路径
 
 Core mask 的形状为：
 
@@ -100,21 +100,31 @@ Core mask 的形状为：
 [head, ceil(S/128), ceil(S/96)]
 ```
 
-每个 block 的 row size 为 128、column size 为 96，序列尾块使用实际长度。FlashInfer 的 `VariableBlockSparseAttentionWrapper.plan()` 将 macro mask 展开成 token-level sparse indices，随后 `run()` 计算：
+每个 block 的 row size 为 128、column size 为 96，序列尾块使用实际长度。默认 direct 路径不再让 `VariableBlockSparseAttentionWrapper` 每次从三维 bool mask 展开和 plan，而是直接从 Core mask 构造紧凑 macro CSR：
+
+```text
+macro_indptr : 每个 (head,Q128) 行所选 K96 block 的范围
+macro_bases  : 所选 K96 block 在按 head 展平的 K/V 中的 token 起始偏移
+kv_lens      : 每行实际 token 数，包含尾块实际长度
+qo_indptr    : 每个 (head,Q128) 的实际 query 行范围
+```
+
+route 刷新时只执行一次 FA3 scheduler `plan()`，plan 与该层 route 一起保留；随后 cache interval 内直接复用。每次 `run()` 前仍需调用 FlashInfer 的 CUDA page-op，把 compact K96 bases 展开为底层 paged FA3 接口所需的 vector offsets，但这一步不再经过 Python 级 variable-block 展开，也不会重建 scheduler plan。随后底层直接调用 FA3 `paged_run()` 计算：
 
 ```text
 (O_core, LSE_core)
 ```
 
-为解决此前的 OOM 和 `_vector_sparse_indices_buffer is not large enough`：
+为解决此前的重复 plan、OOM 和 `_vector_sparse_indices_buffer is not large enough`：
 
-- 全模型只共享一个 FlashInfer wrapper 和 workspace，不再为每层永久保存 wrapper。
-- 每次调用都重新 plan，并覆盖上一层的 expanded plan；expanded plan 不做 12 步缓存。
-- vector sparse indices/indptr 在 plan 前按当前 Core mask 的实际展开规模精确分配。
+- 全模型共享一个 FlashInfer float workspace 和 vector-offset workspace。
+- 每层只保留自己的 compact scheduler plan 及较小的 integer plan workspace；`FLASHINFER64_ROUTE_CACHE=True` 且 cache interval 为 12 时，刷新步 plan 一次，后续 11 步不再 plan。
+- vector-offset workspace 按运行中最大实际展开规模增长并复用，不再每次 reset wrapper 或重新分配默认 512MB buffer。
+- direct API 不可用、设备不是 FA3 时，自动回退到原 VariableBlock wrapper；回退路径仍复用已足够大的 vector buffers，但必须逐次 plan。
 - CUDA 路径不在每层保留完整 Residual bool matrix。
-- `FLASHINFER64_ROUTE_CACHE=False` 为默认的低峰值显存模式；此时 compact route 也在每次调用后释放。
+- `FLASHINFER64_ROUTE_CACHE=False` 仍是低峰值显存模式；此时 route identity 在调用后释放，下一次重新选路和 plan。
 
-因此 `CACHE_INTERVAL=12` 不再意味着 FlashInfer expanded plan 被保留 12 步。若显式设置 `FLASHINFER64_ROUTE_CACHE=True`，只复用 Core mask 和 Residual compact indices，FlashInfer plan 仍会逐次重建。
+direct 路径会额外保留每层的 integer scheduler workspace，其大小由 `FLASHINFER64_PLAN_WORKSPACE_MB` 控制，默认 8MB。它用显存换掉重复 plan；若显存不足，可降低该值验证 FlashInfer 是否仍能成功 plan，或关闭 direct 路径回退到共享 wrapper。
 
 ### 3.2 Residual：Q16×K16 grouped Triton/MMA
 
@@ -137,7 +147,9 @@ Triton kernel 的执行方式为：
 
 该 kernel 的优势是查询粒度小、选择灵活，并且同一 Q16 的多个 K16 tiles 在一个 program 内完成，减少逐 microtile launch 的开销。当前 SM90、BF16、head dimension 128 的编译路径已经验证。
 
-### 3.3 Exact LSE merge
+### 3.3 Residual 快速路径与 Exact LSE merge
+
+若 Residual 完全为空，代码直接返回 Core 输出，不启动 Residual kernel，也不执行 merge。若仅少数 Q16 rows 非空，Residual kernel 只分配 `[active_rows,16,head_dim]` 和 `[active_rows,16]` 的 compact 输出/LSE；merge kernel 同样只遍历 compact `residual_active_rows`，并原地更新 Core 输出。不再为 Residual 或 merged output 分配、清零完整 `[head,sequence,head_dim]` tensor。
 
 Core 与 Residual 的支持集互不重叠，但两边各自做了局部 softmax，因此不能直接相加。设两边输出和自然对数域 LSE 分别为：
 
@@ -164,8 +176,11 @@ O   = (w_c O_c + w_r O_r) / (w_c + w_r)
 | `FLASHINFER64_TILE_TOP_RATIO` | `0.25` | 每个 head/Q128 选择的 K96 block 比例 |
 | `FLASHINFER64_TOKEN_TOP_P` | `0.9` | Core 与 Residual 的目标总 fine-score 质量 |
 | `FLASHINFER64_PROMOTION_THRESHOLD` | `24` | 一个 macro 中达到多少个 residual microtiles 后提升为 Core，范围 1–48 |
-| `FLASHINFER64_ROUTE_CACHE` | `False` | 是否复用 compact route；不影响 FlashInfer 每次重新 plan |
+| `FLASHINFER64_ROUTE_CACHE` | `False` | 是否复用 compact route；direct FA3 路径同时复用对应 plan，回退路径仍逐次 plan |
 | `FLASHINFER64_WORKSPACE_MB` | `128` | 全模型共享的 FlashInfer float workspace 大小 |
+| `FLASHINFER64_DIRECT_MACRO_CSR` | `True` | FA3 上启用 compact macro CSR 和每层 plan cache；否则使用 VariableBlock 回退路径 |
+| `FLASHINFER64_PLAN_WORKSPACE_MB` | `8` | direct 路径每层的 integer scheduler workspace |
+| `FLASHINFER64_CORE_ONLY` | `False` | 消融/测速：只运行 macro Core，跳过 Residual selection、promotion、kernel 和 merge |
 
 旧参数 `FLASHINFER64_TOKEN_TOP_RATIO` 和 `FLASHINFER64_TOKEN_TOP_K` 仅为命令兼容保留，当前论文主路径的 Residual 由 `FLASHINFER64_TOKEN_TOP_P` 控制。
 
@@ -183,6 +198,7 @@ O   = (w_c O_c + w_r O_r) / (w_c + w_r)
 | `flashinfer_promotion` | residual occupancy promotion |
 | `flashinfer_residual_compact` | Residual bool mask 压缩及 interaction 统计 |
 | `flashinfer_plan` | FlashInfer mask 展开与 plan |
+| `flashinfer_core_csr_expand` | direct 路径中 K96 macro bases 到 vector offsets 的 CUDA 展开；包含在 Core run 总阶段内，勿重复求和 |
 | `flashinfer_core_run` | FlashInfer Core kernel |
 | `flashinfer_residual_micro_run` | 全部 length-bucket Triton Residual kernels |
 | `flashinfer_residual_bucket_leN` | Residual 长度不超过 N 的单桶 kernel；与上一总阶段嵌套，不应重复求和 |
@@ -201,3 +217,5 @@ O   = (w_c O_c + w_r O_r) / (w_c + w_r)
 - exact LSE merge 保证最终结果严格对应所选稀疏支持集。
 
 因此其主要创新叙事可以概括为：**分层质量路由（hierarchical mass routing）与密度自适应异构 kernel 调度（density-adaptive heterogeneous kernel dispatch）相结合。**
+
+`FLASHINFER64_CORE_ONLY=True` 是判断方法是否值得继续优化的关键消融：先把 Core density 调到与 DFSAttn 相同，比较 `flashinfer_core_run + 摊销后的 flashinfer_plan`；只有 Core 明显快于 DFSAttn，才有预算容纳 Residual 和 exact merge。该开关不是最终算法，也不用于掩盖质量差异。

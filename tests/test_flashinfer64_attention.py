@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
@@ -10,6 +11,7 @@ from dfsattn.flashinfer64_attention import (
     Q_MACRO,
     _build_residual_csr,
     _ensure_flashinfer_vector_workspace,
+    _merge_lse_active_rows,
     _promote_residual_microtiles,
     _select_residual_to_total_mass,
     _select_hyvideo_core_tiles,
@@ -107,8 +109,10 @@ class FlashInfer64AttentionTest(unittest.TestCase):
             _vector_sparse_indptr_buffer = torch.empty(3, dtype=torch.int32)
             _float_workspace_buffer = torch.empty(1, dtype=torch.uint8)
             _int_workspace_buffer = torch.empty(1, dtype=torch.uint8)
+            reset_calls = 0
 
             def reset_workspace_buffer(self, **kwargs) -> None:
+                self.reset_calls += 1
                 self._vector_sparse_indices_buffer = kwargs[
                     "vector_sparse_indices_buffer"
                 ]
@@ -126,6 +130,67 @@ class FlashInfer64AttentionTest(unittest.TestCase):
             wrapper._vector_sparse_indptr_buffer.numel(),
             wrapper._paged_kv_indptr_buf.numel(),
         )
+        _ensure_flashinfer_vector_workspace(wrapper)
+        self.assertEqual(wrapper.reset_calls, 1)
+
+    def test_core_only_skips_all_residual_work(self) -> None:
+        torch.manual_seed(21)
+        sequence = 193
+        q = torch.randn(1, 2, sequence, 16)
+        k, v = torch.randn_like(q), torch.randn_like(q)
+        backend = FlashInfer64Attention()
+        actual = backend(
+            q, k, v,
+            video_perm=None,
+            video_len=None,
+            route_mode="topk_topp",
+            tile_top_p=0.25,
+            tile_top_ratio=0.5,
+            token_top_k=None,
+            token_top_ratio=0.1,
+            token_top_p=1.0,
+            promotion_threshold=1,
+            reuse_route=True,
+            core_only=True,
+            refresh_route=True,
+            record_density=True,
+        )
+        route = backend.route
+        self.assertTrue(route.core_only)
+        self.assertEqual(route.residual_indices.numel(), 0)
+        self.assertEqual(route.residual_active_rows.numel(), 0)
+        self.assertEqual(route.residual_buckets, ())
+        self.assertEqual(backend.last_stats["residual_token_interactions"], 0)
+
+        support = route.core_mask.repeat_interleave(Q_MACRO, 1).repeat_interleave(
+            K_MACRO, 2
+        )[:, :sequence, :sequence]
+        logits = torch.matmul(q[0], k[0].transpose(1, 2)) / (q.shape[-1] ** 0.5)
+        logits.masked_fill_(~support, float("-inf"))
+        expected = torch.matmul(torch.softmax(logits, dim=-1), v[0])[None]
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+    def test_active_row_merge_does_not_touch_inactive_q16_rows(self) -> None:
+        torch.manual_seed(22)
+        core_out = torch.randn(1, 33, 8)
+        residual_out = torch.randn_like(core_out)
+        core_lse = torch.randn(1, 33)
+        residual_lse = torch.randn(1, 33)
+        route = SimpleNamespace(
+            residual_active_rows=torch.tensor([1], dtype=torch.int32)
+        )
+        original = core_out.clone()
+        actual = _merge_lse_active_rows(
+            core_out, core_lse, residual_out, residual_lse, route
+        )
+        full = torch.logaddexp(core_lse, residual_lse)
+        expected_active = (
+            torch.exp(core_lse[..., None] - full[..., None]) * original
+            + torch.exp(residual_lse[..., None] - full[..., None]) * residual_out
+        )
+        expected = original.clone()
+        expected[:, 16:32] = expected_active[:, 16:32]
+        torch.testing.assert_close(actual, expected)
 
     def test_macro_topk_plus_micro_topp_matches_union_mask(self) -> None:
         torch.manual_seed(3)
@@ -251,7 +316,7 @@ class FlashInfer64AttentionTest(unittest.TestCase):
         self.assertTrue(bool((residual.sum(-1) == 1).all()))
         self.assertTrue(bool(residual[..., 6].all()))
 
-    def test_route_is_reused_but_expanded_plan_is_rebuilt(self) -> None:
+    def test_cpu_fallback_reuses_route_but_rebuilds_reference_plan(self) -> None:
         torch.manual_seed(9)
         q = torch.randn(1, 2, 193, 16)
         k, v = torch.randn_like(q), torch.randn_like(q)
