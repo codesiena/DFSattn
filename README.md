@@ -323,6 +323,58 @@ that, it starts from `SPARSITY` and refreshes the sparse mask every
 interval. If a scheduled refresh would make sparsity non-positive, DFSAttn skips
 that refresh and keeps using the previous cached mask and sparsity.
 
+## Diagnose Macro Top-k Errors
+
+To test whether coarse Macro Top-k misses a few concentrated Q16/K16
+interactions, first make a same-input attention dump using only the fixed Core
+route:
+
+```bash
+FLASHINFER64_ROUTE_MODE=topk_topp \
+FLASHINFER64_TILE_TOP_RATIO=0.2 \
+FLASHINFER64_TOKEN_TOP_P=0 \
+FLASHINFER64_CORE_ONLY=True \
+SPARSE_EXECUTION=flashinfer64 \
+ATTENTION_DEBUG_DIR=../../res/attention_debug/core_topk02 \
+ATTENTION_DEBUG_LAYERS=0 \
+bash hyvideo_t2v_720p_dfs.sh
+```
+
+The dump from this run is the fixed `128x96` Macro Top-k baseline. Analyze the
+highest-error Q128 regions and add back every omitted macro in those regions:
+
+```bash
+PYTHONPATH=. python analyze_macro_topk_error.py \
+  --input-dump ../../res/attention_debug/core_topk02/step012_layer000_flashinfer64_topk_topp.pt \
+  --base-dump ../../res/attention_debug/core_topk02/step012_layer000_flashinfer64_topk_topp.pt \
+  --output-dir ../../res/macro_topk_error/core_topk02 \
+  --macro-top-ratio 0.2 \
+  --order hilbert3d \
+  --height 480 --width 720 --num-frames 129 \
+  --q-macro-count 32
+```
+
+The analyzer writes `query_errors.csv` (per-query `e_q`),
+`q16_error_summary.csv`, `macro_addback.csv`, `top_addback_macros.csv`,
+`summary.json`, and the key plot `macro_addback_entropy_max.png`. Each row in
+`macro_addback.csv` is one `(head, Q128 macro, omitted K96 macro)` and reports
+`M_g`, `A_g`, normalized `H_g`, `C_g`, plus exact one-macro error recovery.
+The add-back uses the changed softmax denominator, so positive recovery is
+evidence that the omitted macro itself fixes the local error. Use
+`--q-macro-count 0` to run all Q128 regions; the default of 8 keeps the CPU
+fallback practical for quick diagnosis.
+
+For multiple videos, the launch script automatically places dumps under
+`ATTENTION_DEBUG_DIR/prompt_<idx>/` so prompts do not overwrite one another.
+After collecting prompts 0--2, aggregate them with:
+
+```bash
+PYTHONPATH=. python analyze_macro_topk_error_batch.py \
+  --input-root ../../res/attention_debug/core_topk02 \
+  --output-dir ../../res/macro_topk_error/core_topk02_batch \
+  --macro-top-ratio 0.2 --q-macro-count 8
+```
+
 ## Examples
 
 <table>

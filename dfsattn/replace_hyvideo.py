@@ -153,6 +153,17 @@ class HunyuanVideo_DFSAttn_Processor2_0:
             "per_head_mean_abs_error": per_head_mean.cpu().tolist(),
             "per_head_max_abs_error": per_head_max.cpu().tolist(),
         }
+        if self.sparse_execution == "flashinfer64":
+            # Keep the routing configuration next to the tensors so offline
+            # macro add-back analysis can reject a non-Core baseline instead
+            # of silently measuring a different selector.
+            summary.update({
+                "flashinfer64_route_mode": self.flashinfer64_route_mode,
+                "flashinfer64_tile_top_ratio": float(self.flashinfer64_tile_top_ratio),
+                "flashinfer64_token_top_p": float(self.flashinfer64_token_top_p),
+                "flashinfer64_core_only": bool(self.flashinfer64_core_only),
+                "flashinfer64_promotion_threshold": int(self.flashinfer64_promotion_threshold),
+            })
         del diff, dense_norm, per_head_mean, per_head_max
 
         # CPU tensors make the dump portable and prevent torch.load from

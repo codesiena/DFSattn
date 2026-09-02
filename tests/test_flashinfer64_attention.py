@@ -19,9 +19,26 @@ from dfsattn.flashinfer64_attention import (
     select_64_tiles_from_scores,
 )
 from dfsattn.utils.timing import AttentionTimingRecorder
+from analyze_macro_topk_error import fixed_macro_topk, macro_structure
 
 
 class FlashInfer64AttentionTest(unittest.TestCase):
+    def test_macro_structure_uses_48_way_entropy_and_boundary_valid_count(self) -> None:
+        scores = torch.zeros(1, 17, 17)
+        scores[0, 0, 0] = 1.0
+        structure = macro_structure(scores)
+        self.assertEqual(tuple(structure["M_g"].shape), (1, 3, 3))
+        self.assertEqual(int(structure["valid_microtiles"][0, -1, -1]), 5)
+        self.assertEqual(float(structure["M_g"][0, 0, 0]), 1.0)
+        self.assertLess(float(structure["H_g"][0, 0, 0]), 0.1)
+        self.assertEqual(float(structure["C_g"][0, 0, 0]), 1.0)
+
+    def test_fixed_macro_topk_preserves_hyvideo_dense_tail_policy(self) -> None:
+        scores = torch.tensor([[[0.9, 0.1, 0.0, 0.0]]])
+        mask = fixed_macro_topk(scores, 0.2, sequence=300, video_len=220)
+        self.assertTrue(bool(mask[:, 1:, :].all()))
+        self.assertTrue(bool(mask[:, :1, 2:].all()))
+
     def test_top_p_one_selects_zero_probability_tiles(self) -> None:
         scores = torch.tensor([[[1.0, 0.0, 0.0]]])
         mask = select_64_tiles_from_scores(scores, top_p=1.0)

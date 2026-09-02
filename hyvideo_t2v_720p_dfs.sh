@@ -32,6 +32,11 @@ flashinfer64_promotion_threshold="${FLASHINFER64_PROMOTION_THRESHOLD:-24}"
 flashinfer64_route_cache="${FLASHINFER64_ROUTE_CACHE:-False}"
 flashinfer64_core_only="${FLASHINFER64_CORE_ONLY:-False}"
 flashinfer64_direct_macro_csr="${FLASHINFER64_DIRECT_MACRO_CSR:-True}"
+# The current best direct-CSR schedule is one CTA per CSR row.  Set this in
+# the wrapper (and export it) so the effective value is reproducible even when
+# the caller does not specify the variable explicitly.
+flashinfer_csr_expand_cta_multiplier="${FLASHINFER_CSR_EXPAND_CTA_MULTIPLIER:-0}"
+export FLASHINFER_CSR_EXPAND_CTA_MULTIPLIER="$flashinfer_csr_expand_cta_multiplier"
 if [ "$selector_mode" = "kp" ]; then
     sparse_execution="${SPARSE_EXECUTION:-hybrid}"
     export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -70,10 +75,10 @@ num_inference_steps="${NUM_INFERENCE_STEPS:-50}"
 dense_interval="${DENSE_INTERVAL:-0}"
 rest_steps="${REST_STEPS:-0}"
 skip_steps2="${SKIP_STEPS2:-0}"
-record_density="${RECORD_DENSITY:-True}"
 attention_debug_dir="${ATTENTION_DEBUG_DIR:-}"
 attention_debug_step="${ATTENTION_DEBUG_STEP:--1}"
 attention_debug_layers="${ATTENTION_DEBUG_LAYERS:-0}"
+attention_debug_stop="${ATTENTION_DEBUG_STOP:-True}"
 block_mask_dir="${BLOCK_MASK_DIR:-}"
 block_mask_heads="${BLOCK_MASK_HEADS:-0}"
 subblock_profile_dir="${SUBBLOCK_PROFILE_DIR:-}"
@@ -84,7 +89,16 @@ if [ "$sparse_execution" = "flashinfer64" ]; then
     else
         flashinfer64_route_tag="topp${flashinfer64_top_p}_totaltopp${flashinfer64_token_top_p}_promote${flashinfer64_promotion_threshold}"
     fi
-    output_dir="${OUTPUT_DIR:-${res_root}/flashinfer64/${dataset_name}/${model_name}/seed${seed}_${flashinfer64_route_tag}_${order}_${height}_routecache${flashinfer64_route_cache}_coreonly${flashinfer64_core_only}_directcsr${flashinfer64_direct_macro_csr}_cache${cache_interval}}"
+    default_output_dir="${res_root}/flashinfer64/${dataset_name}/${model_name}/seed${seed}_${flashinfer64_route_tag}_${order}_${height}_routecache${flashinfer64_route_cache}_coreonly${flashinfer64_core_only}_directcsr${flashinfer64_direct_macro_csr}_ctamul${flashinfer_csr_expand_cta_multiplier}_cache${cache_interval}"
+    if [ -n "${OUTPUT_DIR:-}" ]; then
+        output_dir="${OUTPUT_DIR%/}"
+        case "$output_dir" in
+            *"ctamul${flashinfer_csr_expand_cta_multiplier}"*) ;;
+            *) output_dir="${output_dir}_ctamul${flashinfer_csr_expand_cta_multiplier}" ;;
+        esac
+    else
+        output_dir="$default_output_dir"
+    fi
 else
     output_dir="${OUTPUT_DIR:-${res_root}/${selector_tag}/${dataset_name}/${model_name}/dfs/ts${tile_size}_${block_size}_seed${seed}_${order}_${height}_cache${cache_interval}}"
 fi
@@ -150,11 +164,14 @@ for prompt_idx in $(seq "$start_idx" "$end_idx"); do
     )
     attention_debug_args=()
     if [ -n "$attention_debug_dir" ]; then
+        # A multi-prompt diagnostic run must keep one Q/K/V dump per video;
+        # otherwise every prompt writes the same step/layer filename.
+        attention_debug_prompt_dir="${attention_debug_dir}/prompt_${prompt_idx}"
         attention_debug_args=(
-            --attention_debug_dir "$attention_debug_dir"
+            --attention_debug_dir "$attention_debug_prompt_dir"
             --attention_debug_step "$attention_debug_step"
             --attention_debug_layers "$attention_debug_layers"
-            --attention_debug_stop True
+            --attention_debug_stop "$attention_debug_stop"
         )
     fi
     python "${REPO_ROOT}/hyvideo_t2v_inference.py" \
@@ -185,9 +202,6 @@ for prompt_idx in $(seq "$start_idx" "$end_idx"); do
         --dense_interval "$dense_interval" \
         --rest_steps "$rest_steps" \
         --skip_steps2 "$skip_steps2" \
-        --save_dense_warmup True \
-        --dense_warmup_output "${out_file%.mp4}_dense_warmup.mp4" \
-        --record_density "$record_density" \
         "${flashinfer64_args[@]}" \
         "${attention_debug_args[@]}" \
         "${block_top_p_args[@]}" \

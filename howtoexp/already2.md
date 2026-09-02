@@ -1,5 +1,54 @@
 # 分层 Top-k/Top-p 与异构 Kernel 稀疏注意力：当前实现概述
 
+## 0. 相较原生 FlashInfer 的改动清单
+
+这里的“原生 FlashInfer”特指原来的 `VariableBlockSparseAttentionWrapper`/FA3 sparse 路径：由调用方提供 variable-block mask，FlashInfer 负责 planning、必要的 token-level index 展开，以及 block-sparse attention 执行。本项目仍然复用 FlashInfer 的 FA3 scheduler 和 Core attention kernel；下面列出在其上新增或替换的部分。
+
+| 层次 | 原生 FlashInfer | 当前实现的改变 |
+|---|---|---|
+| 稀疏决策 | 不负责 HunyuanVideo 的质量路由 | 新增 Q16×K16 fine score、Q128×K96 macro score、Core macro Top-k/Top-p、Residual total Top-p 和 occupancy promotion |
+| 支持集 | 一个 sparse mask/一个 attention 分支 | 拆成互不重叠的 Core 与 Residual 支持集，分别执行后 exact LSE merge |
+| Core 粒度 | 由 wrapper 的 variable blocks 处理 | 将上层逻辑固定到 `Q128 × K96`，与 SM90 FA3 工作块对齐；当前实验的有效序列按该布局对齐，代码保留尾块处理仅作为通用防御路径 |
+| Core 表示 | 由 bool/variable-block mask 进入 wrapper，再由 wrapper 展开 | 直接从 Core mask 构造 `macro_indptr + macro_bases + kv_lens + qo_indptr` 的紧凑 macro-CSR，绕过 Python 级 variable-block 展开 |
+| FA3 plan 生命周期 | 原路径通常在 sparse forward 中重新建立 wrapper/workspace 并 plan | route 刷新时 plan 一次，按 route 和 layer 保留；cache interval 内复用 plan |
+| CSR 到 token offsets | 使用 FlashInfer page-op 展开 | 保留 page-op 以满足 FA3 paged-attention ABI，但修复原 kernel 的重复 row 处理/写入竞争，并增加 CTA 数运行时配置 |
+| Residual 执行 | 没有本项目的细粒度补偿分支 | 新增 grouped Triton/MMA Q16×K16 online-softmax kernel，按实际 CSR 长度分桶执行 |
+| Residual 存储 | 不适用 | bool mask 压缩为 `indices + indptr`，只保留非空 row；按 `≤4/8/16/32/64/...` K16 数量分桶，避免全局最大长度 padding |
+| Residual 输出与 merge | 不适用 | 只为 active rows 分配 compact output/LSE；新增 exact LSE merge，并原地更新 Core output |
+| 视频 token 布局 | 不包含本项目的视频 Hilbert/边界处理 | 新增 Q/K/V 视频 token permutation 与 inverse permutation；文本区域、跨模态边界块保留 dense |
+| 选择确定性 | 不针对本项目的量化 score tie 做规则约束 | Residual/需要完整排序的路径使用 stable sort，使输入 K index 顺序成为 tie-break，降低 BF16/FP16 并列时因 batch/GEMM 形状改变选择结果的风险 |
+| route 与 workspace | 由 wrapper 管理其自身临时 buffer | 全模型共享 float/vector-offset workspace，按最大实际需求增长复用；每层保留紧凑 plan 和可配置 integer plan workspace |
+| 显存占用 | 可能保留完整 mask、expanded buffer 或反复 reset workspace | CUDA 路径不长期保留完整 Residual bool matrix，不为 Residual/merge 分配完整 `[head, sequence, dim]` 临时输出 |
+| 兼容性 | 使用 FlashInfer 原生路径 | direct macro-CSR/FA3 不可用时回退到 VariableBlock wrapper；因此该改动不是对所有设备的强制替换 |
+| 观测与消融 | 只有基础调用计时 | 新增 route、plan、CSR expand、Core/Residual kernel、bucket、merge、density 和 residual 长尾统计 |
+
+因此，当前方法不是替换 FlashInfer 的 FA3 attention，而是：**用新的质量感知路由和数据布局决定“算哪些块”，用 direct macro-CSR 和缓存减少 wrapper 开销，用自定义 Residual kernel 补充细粒度区域，最后仍由 FlashInfer FA3 完成规则 Core 的主要计算。**
+
+### 0.1 改动边界与不应重复归因的部分
+
+- `Q128 × K96`、FA3 `paged_run`、SM90 scheduler 和 online-softmax Core kernel 仍是 FlashInfer 提供的能力；我们的改动主要在路由、输入表示、生命周期和 Residual 分支。
+- token-level vector offsets 仍然会生成，因为这是当前 FA3 paged-attention 的输入 ABI 要求；direct macro-CSR 只是把生成点从 wrapper 的 variable-block planning 中移到可控的 page-op，并通过 workspace/cache/CTA 调度降低代价。
+- `flashinfer_core_run` 的计时包含 `flashinfer_core_csr_expand`，`flashinfer_residual_micro_run` 的计时包含各个 `flashinfer_residual_bucket_leN`；分析时不能把嵌套项再次累加。
+- 旧 DFS packed 路径中曾出现的 selected-value 四维临时张量 OOM，则通过“分别计算两支的输出与 LSE、最后 merge”这一状态分解规避；当前 FlashInfer64 路径进一步使用 compact Residual output，不保留完整 Residual bool/output 临时张量。
+
+### 0.2 Page-op 修复与 CTA 配置
+
+本地 FlashInfer 的 `BlockSparseIndicesToVectorSparseOffsetsKernel` 原先启动 `num_sms` 个 CTA，但每个 CTA 都从自己的 `blockIdx.x` 开始、以步长 1 处理后续 rows，导致多个 CTA 重复处理同一 CSR row，并对相同输出位置发生竞争写入。当前改为 grid-stride row 分配：
+
+```cpp
+for (int b = blockIdx.x; b < batch_size; b += gridDim.x)
+```
+
+同时通过 `FLASHINFER_CSR_EXPAND_CTA_MULTIPLIER` 配置 CTA 数：正整数 `N` 使用 `min(batch_size, N × SM数)`，`0` 使用 `batch_size`（一行一个 CTA）。在 HunyuanVideo 480p、相同 route 配置下，实测结果为：
+
+| 配置 | CSR expand | Attention | E2E GPU |
+|---|---:|---:|---:|
+| `1 × SM` | 5.023 ms | 32.932 ms | 219.934 s |
+| `4 × SM` | 4.731 ms | 32.684 ms | 219.158 s |
+| 一行一个 CTA | **0.133 ms** | **29.256 ms** | **209.347 s** |
+
+三种配置的 `sparsity_records.csv`、`density_records.csv` 和输出视频一致；减去 CSR expand 后，FA3 Core 实际时间均约 7.30 ms，说明这部分收益来自 CSR 调度而非改变了 attention 计算。当前建议将“一行一个 CTA”作为 direct CSR 的默认实验配置。
+
 ## 1. 核心思路
 
 当前新增的方法将一次注意力拆成两个互不重叠的计算分支：
@@ -8,7 +57,7 @@
 - **Residual**：以 `Q16 × K16` 为单位补充 Core 没覆盖但质量较高的细粒度区域，交给 grouped Triton/MMA kernel。
 - **Merge**：两个分支分别计算输出和 LSE，最后用 exact LSE merge 得到与二者并集完全等价的 softmax 结果。
 
-这样做的目的，是让规则的大块利用 FlashInfer 的高吞吐，同时用较小的 microtile 避免大块选择造成的精度损失。在当前 H100、head dimension 128、FA3 paged-prefill 路径中，FlashInfer SM90 kernel 的原生工作块就是 `CTA_Q=128, CTA_KV=96`；因此上层 Core 的 `Q128 × K96` 与该物理工作块对齐。序列最后不足 96 的 K 尾块仍由 predication 处理。
+这样做的目的，是让规则的大块利用 FlashInfer 的高吞吐，同时用较小的 microtile 避免大块选择造成的精度损失。在当前 H100、head dimension 128、FA3 paged-prefill 路径中，FlashInfer SM90 kernel 的原生工作块就是 `CTA_Q=128, CTA_KV=96`；因此上层 Core 的 `Q128 × K96` 与该物理工作块对齐。当前实验的有效序列由上层布局保证按 `128 × 96` 对齐，不会产生 partial K block；实现中的尾块 predication 仅保留给其他序列长度的兼容场景。
 
 整体数据流如下：
 
@@ -100,12 +149,12 @@ Core mask 的形状为：
 [head, ceil(S/128), ceil(S/96)]
 ```
 
-每个 block 的 row size 为 128、column size 为 96，序列尾块使用实际长度。默认 direct 路径不再让 `VariableBlockSparseAttentionWrapper` 每次从三维 bool mask 展开和 plan，而是直接从 Core mask 构造紧凑 macro CSR：
+每个 block 的 row size 为 128、column size 为 96；当前实验的有效序列已经对齐，因此实际运行没有 partial K block。代码仍保留尾块实际长度的处理，以支持其他序列长度。默认 direct 路径不再让 `VariableBlockSparseAttentionWrapper` 每次从三维 bool mask 展开和 plan，而是直接从 Core mask 构造紧凑 macro CSR：
 
 ```text
 macro_indptr : 每个 (head,Q128) 行所选 K96 block 的范围
 macro_bases  : 所选 K96 block 在按 head 展平的 K/V 中的 token 起始偏移
-kv_lens      : 每行实际 token 数，包含尾块实际长度
+kv_lens      : 每行实际 token 数；当前对齐配置下为选中 K96 blocks 数量乘 96，通用路径可容纳尾块实际长度
 qo_indptr    : 每个 (head,Q128) 的实际 query 行范围
 ```
 
@@ -181,6 +230,7 @@ O   = (w_c O_c + w_r O_r) / (w_c + w_r)
 | `FLASHINFER64_DIRECT_MACRO_CSR` | `True` | FA3 上启用 compact macro CSR 和每层 plan cache；否则使用 VariableBlock 回退路径 |
 | `FLASHINFER64_PLAN_WORKSPACE_MB` | `8` | direct 路径每层的 integer scheduler workspace |
 | `FLASHINFER64_CORE_ONLY` | `False` | 消融/测速：只运行 macro Core，跳过 Residual selection、promotion、kernel 和 merge |
+| `FLASHINFER_CSR_EXPAND_CTA_MULTIPLIER` | C++ 为 `1`；DFS wrapper 为 `0` | direct CSR 展开 kernel 的 CTA 数；正整数 `N` 表示 `min(batch_size, N × SM数)`，`0` 表示一行一个 CTA。wrapper 会将实际值写入 FlashInfer output dir |
 
 旧参数 `FLASHINFER64_TOKEN_TOP_RATIO` 和 `FLASHINFER64_TOKEN_TOP_K` 仅为命令兼容保留，当前论文主路径的 Residual 由 `FLASHINFER64_TOKEN_TOP_P` 控制。
 
