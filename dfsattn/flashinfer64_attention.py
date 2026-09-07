@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import os
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -57,6 +57,7 @@ Q_MICROS_PER_MACRO = Q_MACRO // MICRO
 K_MICROS_PER_MACRO = K_MACRO // MICRO
 BLOCK_SIZE = Q_MACRO  # historical compatibility only
 RESIDUAL_BUCKET_CAPS = (4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
+OCCUPANCY_TAU_SWEEP = (8, 16, 24, 32, 40, 48)
 
 # The compatibility VariableBlock path keeps one model-wide ephemeral wrapper.
 # The direct FA3 path instead stores one compact scheduler plan per layer so a
@@ -71,6 +72,8 @@ _shared_direct_pin_workspace: Optional[torch.Tensor] = None
 @dataclass
 class FlashInfer64Route:
     core_mask: torch.Tensor          # [H, ceil(S/128), ceil(S/96)]
+    core_execution_mask: torch.Tensor  # includes anchors for empty Q128 rows
+    core_empty_qblocks: torch.Tensor  # bool [H, ceil(S/128)]
     residual_mask: Optional[torch.Tensor]  # CPU reference only; never retained on CUDA
     residual_indices: torch.Tensor   # CSR column indices [nnz]
     residual_indptr: torch.Tensor    # CSR row pointers [H*ceil(S/16)+1]
@@ -93,6 +96,13 @@ class FlashInfer64Route:
     residual_count_p95: float
     residual_count_max: float
     residual_count_nonempty_ratio: float
+    fine_top_k: int
+    fine_top_ratio: float
+    occupancy_threshold: int
+    macro_occupancy: torch.Tensor  # uint8, [H, ceil(S/128), ceil(S/96)]
+    occupancy_histogram: Tuple[int, ...]
+    head_occupancy_stats: Tuple[Dict[str, Any], ...]
+    head_tau_stats: Tuple[Dict[str, Any], ...]
 
 
 def _timing_start(recorder: Any, device: torch.device) -> Any:
@@ -187,6 +197,309 @@ def select_64_tiles_topk_from_scores(tile_scores, *, top_ratio: float):
     count = max(1, math.ceil(tile_scores.shape[-1] * top_ratio))
     indices = torch.topk(tile_scores, count, dim=-1, sorted=False).indices
     return torch.zeros_like(tile_scores, dtype=torch.bool).scatter_(-1, indices, True)
+
+
+def select_fine_topk_from_scores(
+    micro_scores: torch.Tensor, *, top_k: Optional[int] = None,
+    top_ratio: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return compact Q16/K16 Top-k indices and their valid-slot mask.
+
+    The second tensor is needed for short video/text tails where the requested
+    ``top_k`` can be larger than the number of video K16 tiles.  Keeping the
+    selection compact is also what lets the CUDA route avoid materializing a
+    complete ``[head, Q16, K16]`` bool mask.
+    """
+    if micro_scores.ndim != 3:
+        raise ValueError("micro_scores must have shape [heads, q16, k16]")
+    k_micro = micro_scores.shape[-1]
+    if top_ratio is not None:
+        if not 0.0 < top_ratio <= 1.0:
+            raise ValueError(f"fine top_ratio must be in (0, 1], got {top_ratio}")
+        ratio_top_k = max(1, math.ceil(k_micro * top_ratio))
+        if top_k is not None and top_k != ratio_top_k:
+            raise ValueError("top_k and top_ratio resolve to different selections")
+        top_k = ratio_top_k
+    if top_k is None:
+        raise ValueError("one of top_k or top_ratio must be provided")
+    if not 1 <= top_k <= k_micro:
+        raise ValueError(f"fine top_k must be in [1, {k_micro}], got {top_k}")
+    values, indices = torch.topk(
+        micro_scores, top_k, dim=-1, largest=True, sorted=True
+    )
+    return indices.to(torch.int32).contiguous(), values > 0
+
+
+def _fine_topk_occupancy_route(
+    micro_scores: torch.Tensor,
+    *,
+    fine_top_k: int,
+    fine_top_ratio: Optional[float] = None,
+    occupancy_threshold: int,
+    sequence: int,
+    video_len: Optional[int],
+    fine_indices: Optional[torch.Tensor] = None,
+    fine_valid: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the new Fine Top-k -> uint8 occupancy -> Core/Residual route."""
+    if not 1 <= occupancy_threshold <= Q_MICROS_PER_MACRO * K_MICROS_PER_MACRO:
+        raise ValueError(
+            "occupancy threshold must be in [1, 48], "
+            f"got {occupancy_threshold}"
+        )
+    if fine_indices is None or fine_valid is None:
+        if fine_top_k is not None:
+            fine_indices, fine_valid = select_fine_topk_from_scores(
+                micro_scores, top_k=fine_top_k
+            )
+        else:
+            fine_indices, fine_valid = select_fine_topk_from_scores(
+                micro_scores, top_ratio=fine_top_ratio
+            )
+    heads, q_micro, k_micro = micro_scores.shape
+    q_blocks = _ceil_div(sequence, Q_MACRO)
+    k_blocks = _ceil_div(sequence, K_MACRO)
+    q_parent = torch.arange(q_micro, device=micro_scores.device) // Q_MICROS_PER_MACRO
+    k_parent = fine_indices // K_MICROS_PER_MACRO
+
+    # Only fully-video macro regions participate in Fine Top-k.  The existing
+    # HunyuanVideo policy makes the macro containing the text boundary dense.
+    if video_len is None or video_len >= sequence:
+        video_q_blocks, video_k_blocks = q_blocks, k_blocks
+    else:
+        video_len = max(0, video_len)
+        video_q_blocks = min(q_blocks, video_len // Q_MACRO)
+        video_k_blocks = min(k_blocks, video_len // K_MACRO)
+    route_q_valid = q_parent[:, None] < video_q_blocks
+    route_k_valid = k_parent < video_k_blocks
+    fine_valid = fine_valid & route_q_valid[None, :, :] & route_k_valid
+
+    # uint8 is sufficient because one macro has at most 8*6=48 selected
+    # microtiles.  scatter_add is performed directly into the compact macro
+    # occupancy buffer; no full fine-grained bool mask is retained.
+    occupancy = torch.zeros(
+        (heads, q_blocks, k_blocks), dtype=torch.uint8, device=micro_scores.device
+    )
+    macro_linear = (
+        q_parent[None, :, None] * k_blocks + k_parent
+    ).expand(heads, -1, -1)
+    occupancy_flat = occupancy.view(heads, -1)
+    occupancy_flat.scatter_add_(
+        1,
+        macro_linear.reshape(heads, -1).long(),
+        fine_valid.to(torch.uint8).reshape(heads, -1),
+    )
+
+    core = occupancy >= occupancy_threshold
+    if video_len is not None and video_len < sequence:
+        q_dense_start = min(q_blocks, video_len // Q_MACRO)
+        k_dense_start = min(k_blocks, video_len // K_MACRO)
+        core[:, q_dense_start:, :] = True
+        core[:, :, k_dense_start:] = True
+
+    selected_macro = core[:, q_parent, :].gather(2, k_parent.long())
+    residual_valid = fine_valid & ~selected_macro
+    return core, fine_indices, residual_valid, occupancy
+
+
+def _build_residual_csr_from_fine_indices(
+    fine_indices: torch.Tensor,
+    fine_valid: torch.Tensor,
+    *,
+    q_micro_blocks: int,
+    k_micro_blocks: int,
+    core_mask: torch.Tensor,
+    build_mask: bool,
+):
+    """Pack compact Fine Top-k output into the existing Residual CSR format."""
+    heads = fine_indices.shape[0]
+    q_parent = torch.arange(q_micro_blocks, device=fine_indices.device) // Q_MICROS_PER_MACRO
+    k_parent = fine_indices // K_MICROS_PER_MACRO
+    selected_macro = core_mask[:, q_parent, :].gather(2, k_parent.long())
+    keep = fine_valid & ~selected_macro
+    flat_keep = keep.reshape(heads * q_micro_blocks, -1)
+    counts = flat_keep.sum(-1, dtype=torch.int32)
+    indptr = torch.empty(counts.numel() + 1, dtype=torch.int32, device=fine_indices.device)
+    indptr[0] = 0
+    torch.cumsum(counts, dim=0, out=indptr[1:])
+    indices = fine_indices.reshape(heads * q_micro_blocks, -1).masked_select(flat_keep).contiguous()
+
+    caps = list(RESIDUAL_BUCKET_CAPS)
+    while caps[-1] < k_micro_blocks:
+        caps.append(caps[-1] * 2)
+    all_rows = torch.arange(counts.numel(), dtype=torch.int32, device=fine_indices.device)
+    buckets = []
+    lower = 0
+    for cap in caps:
+        row_ids = all_rows.masked_select((counts > lower) & (counts <= cap))
+        if row_ids.numel():
+            buckets.append((cap, row_ids.contiguous()))
+        lower = cap
+
+    if counts.numel():
+        count_float = counts.float()
+        p50, p95 = torch.quantile(
+            count_float, torch.tensor((0.50, 0.95), device=fine_indices.device)
+        ).tolist()
+        stats = (
+            float(count_float.mean().item()), float(p50), float(p95),
+            float(counts.max().item()), float((counts > 0).float().mean().item()),
+        )
+    else:
+        stats = (0.0, 0.0, 0.0, 0.0, 0.0)
+
+    residual_mask = None
+    if build_mask:
+        residual_mask = torch.zeros(
+            (heads, q_micro_blocks, k_micro_blocks),
+            dtype=torch.bool, device=fine_indices.device,
+        )
+        # The compact indices are row-concatenated, so fill the reference mask
+        # row by row only on the CPU/reference path.
+        flat_mask = residual_mask.view(heads * q_micro_blocks, k_micro_blocks)
+        for row in range(flat_mask.shape[0]):
+            start, end = indptr[row].item(), indptr[row + 1].item()
+            if end > start:
+                flat_mask[row, indices[start:end].long()] = True
+    active_rows = torch.cat(tuple(rows for _, rows in buckets), dim=0) if buckets else torch.empty(
+        0, dtype=torch.int32, device=fine_indices.device
+    )
+    return residual_mask, indices, indptr, tuple(buckets), active_rows, stats
+
+
+def _fine_route_valid_mask(
+    fine_indices: torch.Tensor,
+    fine_valid: torch.Tensor,
+    *,
+    q_micro_blocks: int,
+    sequence: int,
+    video_len: Optional[int],
+) -> torch.Tensor:
+    """Keep Fine Top-k slots belonging to fully-video macro regions."""
+    q_parent = torch.arange(
+        q_micro_blocks, device=fine_indices.device
+    ) // Q_MICROS_PER_MACRO
+    k_parent = fine_indices // K_MICROS_PER_MACRO
+    q_blocks = _ceil_div(sequence, Q_MACRO)
+    k_blocks = _ceil_div(sequence, K_MACRO)
+    if video_len is None or video_len >= sequence:
+        video_q_blocks, video_k_blocks = q_blocks, k_blocks
+    else:
+        video_q_blocks = min(q_blocks, max(0, video_len) // Q_MACRO)
+        video_k_blocks = min(k_blocks, max(0, video_len) // K_MACRO)
+    return fine_valid & (
+        (q_parent[None, :, None] < video_q_blocks)
+        & (k_parent < video_k_blocks)
+    )
+
+
+def _compute_head_occupancy_tau_stats(
+    micro_scores: torch.Tensor,
+    fine_indices: torch.Tensor,
+    fine_valid: torch.Tensor,
+    occupancy: torch.Tensor,
+    *,
+    sequence: int,
+    video_len: Optional[int],
+) -> Tuple[Tuple[Dict[str, Any], ...], Tuple[Dict[str, Any], ...]]:
+    """Analyze all tau values from one unchanged Fine Top-k support.
+
+    This is intentionally statistics-only.  It builds no FlashInfer plan and
+    launches no Core/Residual kernel, so tau sweeps do not add runtime to the
+    actual attention path.
+    """
+    heads, q_micro, k_micro = micro_scores.shape
+    q_blocks, k_blocks = occupancy.shape[1:]
+    q_sizes = torch.full((q_blocks,), Q_MACRO, dtype=torch.float32, device=occupancy.device)
+    k_sizes = torch.full((k_blocks,), K_MACRO, dtype=torch.float32, device=occupancy.device)
+    q_sizes[-1] = sequence - (q_blocks - 1) * Q_MACRO
+    k_sizes[-1] = sequence - (k_blocks - 1) * K_MACRO
+    q16_sizes = torch.minimum(
+        torch.full((q_micro,), MICRO, dtype=torch.float32, device=occupancy.device),
+        torch.as_tensor(sequence, device=occupancy.device, dtype=torch.float32)
+        - torch.arange(q_micro, device=occupancy.device, dtype=torch.float32) * MICRO,
+    )
+    k16_ids = fine_indices.long()
+    k16_sizes = torch.minimum(
+        torch.full_like(k16_ids, MICRO, dtype=torch.float32),
+        torch.as_tensor(sequence, device=occupancy.device, dtype=torch.float32)
+        - k16_ids.to(torch.float32) * MICRO,
+    )
+    route_valid = _fine_route_valid_mask(
+        fine_indices, fine_valid, q_micro_blocks=q_micro,
+        sequence=sequence, video_len=video_len,
+    )
+    q_parent = torch.arange(q_micro, device=occupancy.device) // Q_MICROS_PER_MACRO
+    k_parent = fine_indices.long() // K_MICROS_PER_MACRO
+    entropy_rows = micro_scores
+    q_valid = q_parent < (q_blocks if video_len is None or video_len >= sequence else video_len // Q_MACRO)
+    entropy = -(entropy_rows.clamp_min(torch.finfo(entropy_rows.dtype).tiny).log() * entropy_rows).sum(-1)
+    entropy = entropy[:, q_valid].mean(-1)
+
+    occupancy_long = occupancy.long()
+    head_occupancy = []
+    for head in range(heads):
+        values = occupancy_long[head].reshape(-1)
+        histogram = torch.bincount(values, minlength=49).tolist()
+        nonzero = values[values > 0].float()
+        quantiles = torch.quantile(values.float(), torch.tensor((0.50, 0.95), device=values.device)).tolist()
+        weighted = (
+            (values.float() * values.float()).sum() / values.float().sum().clamp_min(1.0)
+        )
+        head_occupancy.append({
+            "head": head,
+            "occupancy_histogram": tuple(int(x) for x in histogram),
+            "mean": float(values.float().mean().item()),
+            "p50": float(quantiles[0]),
+            "p95": float(quantiles[1]),
+            "max": float(values.max().item()),
+            "weighted_occupancy": float(weighted.item()),
+            "fine_entropy_mean": float(entropy[head].item()),
+            "macro_count": int(values.numel()),
+        })
+
+    head_tau = []
+    total_possible = float(sequence * sequence)
+    for tau in OCCUPANCY_TAU_SWEEP:
+        core = occupancy >= tau
+        if video_len is not None and video_len < sequence:
+            q_dense_start = min(q_blocks, max(0, video_len) // Q_MACRO)
+            k_dense_start = min(k_blocks, max(0, video_len) // K_MACRO)
+            core = core.clone()
+            core[:, q_dense_start:, :] = True
+            core[:, :, k_dense_start:] = True
+        selected_core = core[:, q_parent, :].gather(2, k_parent)
+        residual = route_valid & ~selected_core
+        residual_row_counts = residual.sum(-1).float()
+        residual_qk = (
+            residual.float()
+            * q16_sizes[None, :, None]
+            * k16_sizes
+        ).sum((1, 2))
+        core_qk = (
+            core.float()
+            * q_sizes[None, :, None]
+            * k_sizes[None, None, :]
+        ).sum((1, 2))
+        p50_p95 = torch.quantile(
+            residual_row_counts,
+            torch.tensor((0.50, 0.95), device=occupancy.device), dim=1,
+        ).transpose(0, 1)
+        for head in range(heads):
+            head_tau.append({
+                "head": head,
+                "tau": tau,
+                "promoted_macro_count": int((occupancy[head] >= tau).sum().item()),
+                "core_density": float((core_qk[head] / total_possible).item()),
+                "residual_density": float((residual_qk[head] / total_possible).item()),
+                "residual_microtiles": int(residual[head].sum().item()),
+                "residual_row_mean": float(residual_row_counts[head].mean().item()),
+                "residual_row_p50": float(p50_p95[head, 0].item()),
+                "residual_row_p95": float(p50_p95[head, 1].item()),
+                "residual_row_max": float(residual_row_counts[head].max().item()),
+                "residual_row_nonempty_ratio": float((residual_row_counts[head] > 0).float().mean().item()),
+            })
+    return tuple(head_occupancy), tuple(head_tau)
 
 
 def _select_hyvideo_core_tiles(
@@ -335,6 +648,8 @@ def _count_route_interactions(core_mask, residual_mask, sequence):
     core_n = int(
         (core_mask * q_sizes[None, :, None] * k_sizes[None, None]).sum().item()
     )
+    if residual_mask is None:
+        return core_n, 0, 0
     q16 = torch.full(
         (residual_mask.shape[1],), MICRO, device=core_mask.device, dtype=torch.int64
     )
@@ -347,6 +662,51 @@ def _count_route_interactions(core_mask, residual_mask, sequence):
         (residual_mask * q16[None, :, None] * k16[None, None]).sum().item()
     )
     return core_n, residual_n, int(residual_mask.sum().item())
+
+
+def _count_residual_csr_interactions(
+    residual_indices: torch.Tensor, residual_indptr: torch.Tensor,
+    sequence: int, q_micro_blocks: int,
+) -> Tuple[int, int]:
+    """Count exact residual token interactions without rebuilding a bool mask."""
+    counts = residual_indptr[1:] - residual_indptr[:-1]
+    if residual_indices.numel() == 0:
+        return 0, 0
+    row_ids = torch.repeat_interleave(
+        torch.arange(counts.numel(), device=residual_indices.device), counts.long()
+    )
+    q_ids = row_ids % q_micro_blocks
+    q_sizes = torch.minimum(
+        torch.full_like(q_ids, MICRO),
+        torch.as_tensor(sequence, device=q_ids.device) - q_ids * MICRO,
+    )
+    k_sizes = torch.minimum(
+        torch.full_like(residual_indices, MICRO),
+        torch.as_tensor(sequence, device=residual_indices.device) - residual_indices * MICRO,
+    )
+    interactions = (q_sizes * k_sizes).sum()
+    return int(interactions.item()), int(residual_indices.numel())
+
+
+def _make_core_execution_mask(
+    core_mask: torch.Tensor, occupancy: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Give FlashInfer one harmless anchor for a Q128 row with no Core tile.
+
+    Fine Top-k with a high occupancy threshold can legitimately leave a whole
+    Q128 row to Residual.  FlashInfer's paged sparse ABI expects a non-empty
+    KV range per query row, so it gets an anchor tile which is discarded from
+    the logical Core state immediately after the Core run.
+    """
+    empty = ~core_mask.any(dim=-1)
+    if not bool(empty.any().item()):
+        return core_mask, empty
+    execution = core_mask.clone()
+    anchor = occupancy.to(torch.int16).argmax(dim=-1)
+    execution[empty] = F.one_hot(
+        anchor[empty].long(), num_classes=core_mask.shape[-1]
+    ).to(torch.bool)
+    return execution, empty
 
 
 def _build_residual_topk(*args, **kwargs):
@@ -907,7 +1267,10 @@ class FlashInfer64Attention:
             scores = torch.bmm(q, k.transpose(1, 2)).float() * (q.shape[-1] ** -0.5)
             scores.masked_fill_(~mask, float("-inf"))
             lse = torch.logsumexp(scores, -1)
-            output = torch.bmm(torch.softmax(scores, -1).to(v.dtype), v)
+            valid = mask.any(dim=-1, keepdim=True)
+            weights = torch.softmax(torch.where(valid, scores, torch.zeros_like(scores)), -1)
+            weights = torch.where(mask, weights, torch.zeros_like(weights))
+            output = torch.bmm(weights.to(v.dtype), v)
         else:
             if wrapper is None:
                 raise RuntimeError("shared FlashInfer plan is missing")
@@ -919,6 +1282,14 @@ class FlashInfer64Attention:
             else:
                 output, lse = wrapper.run(q, k, v, return_lse=True)
             lse = lse * math.log(2.0)
+        if bool(route.core_empty_qblocks.any().item()):
+            # The execution-only anchor keeps the FlashInfer ABI valid, but
+            # must not contribute to the logical union with Residual.
+            for head, qblock in route.core_empty_qblocks.nonzero(as_tuple=False).tolist():
+                start = qblock * Q_MACRO
+                end = min(start + Q_MACRO, q.shape[1])
+                output[head, start:end] = 0
+                lse[head, start:end] = float("-inf")
         _timing_stop(recorder, start, "flashinfer_core_run", step, layer, q.device)
         return output, lse
 
@@ -926,6 +1297,8 @@ class FlashInfer64Attention:
     def __call__(
         self, q, k, v, *, video_perm, video_len,
         route_mode="topk_topp", tile_top_p: float, tile_top_ratio: float = 0.25,
+        fine_top_ratio: float = 0.2,
+        fine_top_k: Optional[int] = None,
         token_top_k: Optional[int], token_top_ratio: float, token_top_p: float = 0.9,
         promotion_threshold: int = 24,
         reuse_route: bool = False,
@@ -959,6 +1332,8 @@ class FlashInfer64Attention:
             and self.route.route_mode == route_mode and self.route.top_p == tile_top_p
             and self.route.tile_top_ratio == tile_top_ratio and self.route.token_top_p == token_top_p
             and self.route.promotion_threshold == promotion_threshold
+            and (fine_top_k is None or self.route.fine_top_k == fine_top_k)
+            and self.route.fine_top_ratio == fine_top_ratio
             and self.route.core_only == core_only
             and self.route.core_mask.device == q.device
         )
@@ -967,65 +1342,182 @@ class FlashInfer64Attention:
             micro_scores = compute_micro_tile_scores(qh, kh)
             _timing_stop(timing_recorder, fine_start, "flashinfer_fine_score", step_idx, layer_idx, q.device)
 
-            core_score_start = _timing_start(timing_recorder, q.device)
-            macro_scores = aggregate_macro_scores(micro_scores)
-            _timing_stop(timing_recorder, core_score_start, "flashinfer_core_score", step_idx, layer_idx, q.device)
-
-            core_select_start = _timing_start(timing_recorder, q.device)
-            core = _select_hyvideo_core_tiles(
-                macro_scores, route_mode=route_mode, tile_top_p=tile_top_p,
-                tile_top_ratio=tile_top_ratio, sequence=sequence, video_len=video_len,
-            )
-            _timing_stop(timing_recorder, core_select_start, "flashinfer_core_select", step_idx, layer_idx, q.device)
-
-            if core_only:
-                residual = torch.zeros_like(micro_scores, dtype=torch.bool)
-                promoted = 0
-                indices = torch.empty(0, dtype=torch.int32, device=q.device)
-                indptr = torch.zeros(
-                    residual.shape[0] * residual.shape[1] + 1,
-                    dtype=torch.int32, device=q.device,
+            macro_scores = None
+            if route_mode != "fine_topk_occupancy":
+                core_score_start = _timing_start(timing_recorder, q.device)
+                macro_scores = aggregate_macro_scores(micro_scores)
+                _timing_stop(
+                    timing_recorder, core_score_start, "flashinfer_core_score",
+                    step_idx, layer_idx, q.device,
                 )
-                buckets = ()
-                active_rows = torch.empty(0, dtype=torch.int32, device=q.device)
-                residual_count_stats = (0.0, 0.0, 0.0, 0.0, 0.0)
+
+            if route_mode == "fine_topk_occupancy":
+                fine_select_start = _timing_start(timing_recorder, q.device)
+                fine_selection_scores = micro_scores
+                if video_len is not None and video_len < sequence:
+                    video_k_blocks = min(
+                        micro_scores.shape[2] // K_MICROS_PER_MACRO,
+                        video_len // K_MACRO,
+                    )
+                    video_k_micro = video_k_blocks * K_MICROS_PER_MACRO
+                    fine_selection_scores = micro_scores.masked_fill(
+                        torch.arange(micro_scores.shape[2], device=q.device)[None, None, :]
+                        >= video_k_micro,
+                        float("-inf"),
+                    )
+                fine_indices, fine_valid = select_fine_topk_from_scores(
+                    fine_selection_scores,
+                    top_k=fine_top_k,
+                    top_ratio=None if fine_top_k is not None else fine_top_ratio,
+                )
+                resolved_fine_top_k = fine_indices.shape[-1]
+                _timing_stop(
+                    timing_recorder, fine_select_start, "flashinfer_fine_topk",
+                    step_idx, layer_idx, q.device,
+                )
+                # Preserve the unchanged Fine Top-k support for the
+                # statistics-only per-head occupancy/tau analysis.  The
+                # residual builder below reuses ``fine_valid`` for its
+                # compact route and must not destroy this input.
+                selected_fine_valid = _fine_route_valid_mask(
+                    fine_indices,
+                    fine_valid,
+                    q_micro_blocks=micro_scores.shape[1],
+                    sequence=sequence,
+                    video_len=video_len,
+                )
+                occupancy_start = _timing_start(timing_recorder, q.device)
+                core, fine_indices, fine_valid, occupancy = _fine_topk_occupancy_route(
+                    micro_scores,
+                    fine_top_k=resolved_fine_top_k,
+                    fine_top_ratio=fine_top_ratio,
+                    occupancy_threshold=promotion_threshold,
+                    sequence=sequence,
+                    video_len=video_len,
+                    fine_indices=fine_indices,
+                    fine_valid=fine_valid,
+                )
+                _timing_stop(
+                    timing_recorder, occupancy_start, "flashinfer_occupancy",
+                    step_idx, layer_idx, q.device,
+                )
+                if record_density:
+                    head_occupancy_stats, head_tau_stats = _compute_head_occupancy_tau_stats(
+                        micro_scores,
+                        fine_indices,
+                        selected_fine_valid,
+                        occupancy,
+                        sequence=sequence,
+                        video_len=video_len,
+                    )
+                else:
+                    head_occupancy_stats, head_tau_stats = (), ()
+                promoted = int((occupancy >= promotion_threshold).sum().item())
+                if core_only:
+                    indices = torch.empty(0, dtype=torch.int32, device=q.device)
+                    indptr = torch.zeros(
+                        micro_scores.shape[0] * micro_scores.shape[1] + 1,
+                        dtype=torch.int32, device=q.device,
+                    )
+                    buckets = ()
+                    active_rows = torch.empty(0, dtype=torch.int32, device=q.device)
+                    residual_mask = None if q.is_cuda else torch.zeros_like(micro_scores, dtype=torch.bool)
+                    residual_count_stats = (0.0, 0.0, 0.0, 0.0, 0.0)
+                else:
+                    partition_start = _timing_start(timing_recorder, q.device)
+                    residual_mask, indices, indptr, buckets, active_rows, residual_count_stats = (
+                        _build_residual_csr_from_fine_indices(
+                            fine_indices, fine_valid,
+                            q_micro_blocks=micro_scores.shape[1],
+                            k_micro_blocks=micro_scores.shape[2],
+                            core_mask=core,
+                            build_mask=not q.is_cuda,
+                        )
+                    )
+                    _timing_stop(
+                        timing_recorder, partition_start, "flashinfer_partition",
+                        step_idx, layer_idx, q.device,
+                    )
+                residual = None
             else:
-                residual_select_start = _timing_start(timing_recorder, q.device)
-                residual = _select_residual_to_total_mass(
-                    micro_scores, core, total_top_p=token_top_p,
+                head_occupancy_stats, head_tau_stats = (), ()
+                core_select_start = _timing_start(timing_recorder, q.device)
+                core = _select_hyvideo_core_tiles(
+                    macro_scores, route_mode=route_mode, tile_top_p=tile_top_p,
+                    tile_top_ratio=tile_top_ratio, sequence=sequence, video_len=video_len,
                 )
-                _timing_stop(timing_recorder, residual_select_start, "flashinfer_residual_select", step_idx, layer_idx, q.device)
+                _timing_stop(timing_recorder, core_select_start, "flashinfer_core_select", step_idx, layer_idx, q.device)
 
-                promotion_start = _timing_start(timing_recorder, q.device)
-                core, residual, promoted = _promote_residual_microtiles(
-                    residual, core, promotion_threshold=promotion_threshold,
-                )
-                _timing_stop(timing_recorder, promotion_start, "flashinfer_promotion", step_idx, layer_idx, q.device)
+                if core_only:
+                    residual = torch.zeros_like(micro_scores, dtype=torch.bool)
+                    promoted = 0
+                    indices = torch.empty(0, dtype=torch.int32, device=q.device)
+                    indptr = torch.zeros(
+                        residual.shape[0] * residual.shape[1] + 1,
+                        dtype=torch.int32, device=q.device,
+                    )
+                    buckets = ()
+                    active_rows = torch.empty(0, dtype=torch.int32, device=q.device)
+                    residual_count_stats = (0.0, 0.0, 0.0, 0.0, 0.0)
+                else:
+                    residual_select_start = _timing_start(timing_recorder, q.device)
+                    residual = _select_residual_to_total_mass(
+                        micro_scores, core, total_top_p=token_top_p,
+                    )
+                    _timing_stop(timing_recorder, residual_select_start, "flashinfer_residual_select", step_idx, layer_idx, q.device)
 
-                compact_start = _timing_start(timing_recorder, q.device)
-                collect_route_stats = record_density or bool(
-                    timing_recorder is not None and getattr(timing_recorder, "enabled", False)
-                )
-                indices, indptr, buckets, residual_count_stats = _build_residual_csr(
-                    residual, collect_stats=collect_route_stats,
-                )
-                active_rows = torch.cat(
-                    tuple(rows for _, rows in buckets), dim=0
-                ) if buckets else torch.empty(0, dtype=torch.int32, device=q.device)
-                _timing_stop(timing_recorder, compact_start, "flashinfer_residual_compact", step_idx, layer_idx, q.device)
-            core_n, residual_n, residual_tiles = _count_route_interactions(
-                core, residual, sequence
+                    promotion_start = _timing_start(timing_recorder, q.device)
+                    core, residual, promoted = _promote_residual_microtiles(
+                        residual, core, promotion_threshold=promotion_threshold,
+                    )
+                    _timing_stop(timing_recorder, promotion_start, "flashinfer_promotion", step_idx, layer_idx, q.device)
+
+                    compact_start = _timing_start(timing_recorder, q.device)
+                    collect_route_stats = record_density or bool(
+                        timing_recorder is not None and getattr(timing_recorder, "enabled", False)
+                    )
+                    indices, indptr, buckets, residual_count_stats = _build_residual_csr(
+                        residual, collect_stats=collect_route_stats,
+                    )
+                    active_rows = torch.cat(
+                        tuple(rows for _, rows in buckets), dim=0
+                    ) if buckets else torch.empty(0, dtype=torch.int32, device=q.device)
+                    _timing_stop(timing_recorder, compact_start, "flashinfer_residual_compact", step_idx, layer_idx, q.device)
+                occupancy = torch.zeros_like(core, dtype=torch.uint8)
+                residual_mask = residual if not q.is_cuda else None
+            core_execution_mask, core_empty_qblocks = _make_core_execution_mask(
+                core, occupancy
             )
+            core_n, _unused_residual_n, _unused_residual_tiles = _count_route_interactions(
+                core, residual, sequence,
+            )
+            if residual is None:
+                residual_n, residual_tiles = _count_residual_csr_interactions(
+                    indices, indptr, sequence, micro_scores.shape[1]
+                )
+            else:
+                _, residual_n, residual_tiles = _count_route_interactions(
+                    core, residual, sequence
+                )
             # CUDA execution consumes only the compact K16 lists.  Keeping the
             # full bool matrix would cost about 180MB per layer at 480p.
-            residual_mask_for_route = residual if not q.is_cuda else None
+            residual_mask_for_route = residual_mask
+            occupancy_histogram = tuple(
+                torch.bincount(occupancy.reshape(-1).long(), minlength=49).tolist()
+            )
             self.route = FlashInfer64Route(
-                core, residual_mask_for_route, indices, indptr, buckets, active_rows,
+                core, core_execution_mask, core_empty_qblocks,
+                residual_mask_for_route, indices, indptr, buckets, active_rows,
                 sequence, -1 if video_len is None else video_len,
                 route_mode, tile_top_p, tile_top_ratio, token_top_p,
                 promotion_threshold, core_only, promoted,
                 core_n, residual_n, residual_tiles,
                 *residual_count_stats,
+                fine_indices.shape[-1] if route_mode == "fine_topk_occupancy" else (
+                    fine_top_k if fine_top_k is not None else 0
+                ),
+                fine_top_ratio, promotion_threshold, occupancy, occupancy_histogram,
+                head_occupancy_stats, head_tau_stats,
             )
             del micro_scores, macro_scores, residual
 
@@ -1033,12 +1525,19 @@ class FlashInfer64Attention:
         if route is None:
             raise RuntimeError("failed to build hierarchical route")
         if timing_recorder is not None:
+            occupancy_total = max(1, sum(route.occupancy_histogram))
             timing_recorder.record_metrics({
                 "residual_count_mean": route.residual_count_mean,
                 "residual_count_p50": route.residual_count_p50,
                 "residual_count_p95": route.residual_count_p95,
                 "residual_count_max": route.residual_count_max,
                 "residual_count_nonempty_ratio": route.residual_count_nonempty_ratio,
+                "fine_top_k": route.fine_top_k,
+                "fine_top_ratio": route.fine_top_ratio,
+                "occupancy_threshold": route.occupancy_threshold,
+                "occupancy_mean": sum(
+                    i * count for i, count in enumerate(route.occupancy_histogram)
+                ) / occupancy_total,
             })
         # On FA3, each layer retains its compact scheduler plan and cache12
         # skips the next 11 plan calls.  The VariableBlock compatibility path
@@ -1053,7 +1552,7 @@ class FlashInfer64Attention:
         else:
             plan_start = _timing_start(timing_recorder, q.device)
             wrapper, _ = self._plan_core(
-                qh, route.core_mask, route_identity=route,
+                qh, route.core_execution_mask, route_identity=route,
                 direct_macro_csr=direct_macro_csr,
             )
             _timing_stop(timing_recorder, plan_start, "flashinfer_plan", step_idx, layer_idx, q.device)
@@ -1080,6 +1579,7 @@ class FlashInfer64Attention:
         if record_density:
             padding = full_sequence - valid_sequence
             padding_n = qh.shape[0] * padding * padding
+            occupancy_total = max(1, sum(route.occupancy_histogram))
             self.last_stats = {
                 "core_interactions": route.core_interactions + padding_n,
                 "residual_token_interactions": route.residual_interactions,
@@ -1090,6 +1590,14 @@ class FlashInfer64Attention:
                 "residual_count_p95": route.residual_count_p95,
                 "residual_count_max": route.residual_count_max,
                 "residual_count_nonempty_ratio": route.residual_count_nonempty_ratio,
+                "fine_top_k": route.fine_top_k,
+                "occupancy_threshold": route.occupancy_threshold,
+                "occupancy_mean": sum(
+                    i * count for i, count in enumerate(route.occupancy_histogram)
+                ) / occupancy_total,
+                "occupancy_histogram": route.occupancy_histogram,
+                "head_occupancy_stats": route.head_occupancy_stats,
+                "head_tau_stats": route.head_tau_stats,
                 "total_possible": qh.shape[0] * (sequence * sequence + padding * padding),
             }
         _timing_stop(
@@ -1112,4 +1620,5 @@ __all__ = [
     "FlashInfer64Attention", "FlashInfer64Route", "Q_MACRO", "K_MACRO", "MICRO",
     "compute_micro_tile_scores", "aggregate_macro_scores", "compute_64_tile_scores",
     "select_64_tiles", "select_64_tiles_from_scores", "select_64_tiles_topk_from_scores",
+    "select_fine_topk_from_scores",
 ]

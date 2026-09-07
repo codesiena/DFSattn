@@ -72,10 +72,12 @@ def parse_args():
     parser.add_argument("--sparse_execution", choices=["native", "hybrid", "flashinfer64"], default="native", help="DFS execution backend; flashinfer64 now uses Q128xK96 Core plus Q16xK16 Residual.")
     parser.add_argument("--hybrid_threshold", type=int, default=8, help="Promote a 4x4 group of active 16x16 blocks to a 64x64 Core tile at this occupancy (1-16).")
     parser.add_argument("--flashinfer64_top_p", type=float, default=0.25, help="Per-head/per-Q128 macro cumulative mass sent to FlashInfer.")
-    parser.add_argument("--flashinfer64_token_top_k", type=int, default=None, help="Deprecated; FlashInfer64 Top-k is ratio-based. Use --flashinfer64_token_top_ratio.")
+    parser.add_argument("--flashinfer64_token_top_k", type=int, default=None, help="Compatibility alias for --flashinfer64_fine_top_k.")
     parser.add_argument("--flashinfer64_token_top_ratio", type=float, default=0.10, help="Deprecated compatibility field; the new Residual uses micro Top-p.")
-    parser.add_argument("--flashinfer64_route_mode", choices=["topp_topk", "topk_topp"], default="topk_topp", help="Choose macro Top-p or ratio Top-k for the Q128xK96 FlashInfer Core; topk_topp is the paper path.")
+    parser.add_argument("--flashinfer64_route_mode", choices=["topp_topk", "topk_topp", "fine_topk_occupancy"], default="fine_topk_occupancy", help="Old macro Top-p/Top-k routes, or the new Fine Top-k plus uint8 macro occupancy route.")
     parser.add_argument("--flashinfer64_tile_top_ratio", type=float, default=0.25, help="Fraction of K96 macro tiles selected for each head/Q128 in topk_topp mode.")
+    parser.add_argument("--flashinfer64_fine_top_ratio", type=float, default=0.2, help="Fraction of K16 tiles selected per (head,Q16) by the new fine_topk_occupancy route.")
+    parser.add_argument("--flashinfer64_fine_top_k", type=int, default=None, help="Deprecated compatibility override: fixed number of K16 tiles instead of --flashinfer64_fine_top_ratio.")
     parser.add_argument("--flashinfer64_token_top_p", type=float, default=0.9, help="Target total Q16/K16 proxy mass covered by Core plus Residual; rejected mass is not renormalized.")
     parser.add_argument("--flashinfer64_promotion_threshold", type=int, default=24, help="Promote a Q128xK96 tile when at least this many of its 48 Q16xK16 microtiles are selected.")
     parser.add_argument("--flashinfer64_route_cache", type=str2bool, default=False, help="Reuse compact routes across cache intervals. With direct macro CSR this also reuses each layer's FA3 scheduler plan; False rebuilds routes/plans in bounded-memory mode.")
@@ -93,7 +95,7 @@ def parse_args():
     parser.add_argument("--save_dense_warmup", type=str2bool, default=False, help="Save a decoded video immediately after the initial dense warmup")
     parser.add_argument("--dense_warmup_output", type=str, default=None, help="Output path for the post-dense-warmup video")
     parser.add_argument("--record_density", type=str2bool, default=False, help="Record the actual density of sparse attention masks per step")
-    parser.add_argument("--record_timing", type=str2bool, default=True, help="Record video-level CUDA-event totals for Top-k and attention execution")
+    parser.add_argument("--record_timing", type=str2bool, default=False, help="Record video-level CUDA-event totals for Top-k and attention execution")
     parser.add_argument("--timing_csv", type=str, default=None, help="CSV path for video-level timing totals (default: timing.csv beside output_file)")
     parser.add_argument("--attention_debug_dir", type=str, default=None, help="Dump exact Q/K/V, sparse output, and same-input dense output at the first sparse step.")
     parser.add_argument("--attention_debug_step", type=int, default=-1, help="Diffusion step to dump (-1 means --skip_steps).")
@@ -122,7 +124,13 @@ def parse_args():
     if not 0.0 < args.flashinfer64_top_p <= 1.0:
         parser.error("--flashinfer64_top_p must be in (0, 1].")
     if args.flashinfer64_token_top_k is not None:
-        parser.error("--flashinfer64_token_top_k is no longer supported; use --flashinfer64_token_top_ratio.")
+        if args.flashinfer64_fine_top_k is not None and args.flashinfer64_fine_top_k != args.flashinfer64_token_top_k:
+            parser.error("--flashinfer64_token_top_k and --flashinfer64_fine_top_k disagree.")
+        args.flashinfer64_fine_top_k = args.flashinfer64_token_top_k
+    if not 0.0 < args.flashinfer64_fine_top_ratio <= 1.0:
+        parser.error("--flashinfer64_fine_top_ratio must be in (0, 1].")
+    if args.flashinfer64_fine_top_k is not None and args.flashinfer64_fine_top_k < 1:
+        parser.error("--flashinfer64_fine_top_k must be positive.")
     if not 0.0 < args.flashinfer64_token_top_ratio <= 1.0:
         parser.error("--flashinfer64_token_top_ratio must be in (0, 1].")
     if not 0.0 < args.flashinfer64_tile_top_ratio <= 1.0:
@@ -247,6 +255,8 @@ if __name__ == "__main__":
                 args.flashinfer64_token_top_ratio,
                 args.flashinfer64_route_mode,
                 args.flashinfer64_tile_top_ratio,
+                args.flashinfer64_fine_top_ratio,
+                args.flashinfer64_fine_top_k,
                 args.flashinfer64_token_top_p,
                 args.flashinfer64_promotion_threshold,
                 args.flashinfer64_route_cache,
@@ -260,17 +270,16 @@ if __name__ == "__main__":
             processors_id += 1   
     transformer.set_attn_processor(attn_processors)
 
-    # Wall time is the end-to-end generation latency.  CUDA events provide the
-    # corresponding GPU stream time; both boundaries are synchronized so no
-    # previous/following asynchronous work leaks into the measurement.
-    if torch.cuda.is_available():
+    # Timing is opt-in.  The occupancy/tau experiment deliberately does not
+    # create end-to-end timing events or write runtime data.
+    if args.record_timing and torch.cuda.is_available():
         torch.cuda.synchronize()
         e2e_gpu_start = torch.cuda.Event(enable_timing=True)
         e2e_gpu_end = torch.cuda.Event(enable_timing=True)
         e2e_gpu_start.record()
     else:
         e2e_gpu_start = e2e_gpu_end = None
-    total_start_time = time.perf_counter()
+    total_start_time = time.perf_counter() if args.record_timing else None
 
     dense_warmup_saved = [False]
 
@@ -307,15 +316,20 @@ if __name__ == "__main__":
         logger.info("{}; stopping before the remaining denoising steps", exc)
         raise SystemExit(0)
 
-    if e2e_gpu_end is not None:
+    if args.record_timing and e2e_gpu_end is not None:
         e2e_gpu_end.record()
         torch.cuda.synchronize()
         e2e_gpu_ms = e2e_gpu_start.elapsed_time(e2e_gpu_end)
     else:
         e2e_gpu_ms = None
-    total_generation_time = time.perf_counter() - total_start_time
-    
-    logger.info(f"End-to-end generation wall time: {total_generation_time:.3f} s")
+    total_generation_time = (
+        time.perf_counter() - total_start_time
+        if args.record_timing and total_start_time is not None
+        else None
+    )
+
+    if total_generation_time is not None:
+        logger.info(f"End-to-end generation wall time: {total_generation_time:.3f} s")
     if e2e_gpu_ms is not None:
         logger.info(f"End-to-end generation GPU time: {e2e_gpu_ms:.3f} ms")
 
@@ -340,6 +354,7 @@ if __name__ == "__main__":
             prompt=args.prompt,
         )
         DFS_Attention.dump_sparsity_records(os.path.join(output_dir, "sparsity_records.csv"))
+        DFS_Attention.dump_flashinfer64_head_stats(output_dir)
 
     export_to_video(output, args.output_file, fps=24)
 

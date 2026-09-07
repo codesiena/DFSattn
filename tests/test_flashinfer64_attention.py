@@ -10,19 +10,125 @@ from dfsattn.flashinfer64_attention import (
     MICRO,
     Q_MACRO,
     _build_residual_csr,
+    _build_residual_csr_from_fine_indices,
     _ensure_flashinfer_vector_workspace,
+    _compute_head_occupancy_tau_stats,
+    _fine_topk_occupancy_route,
     _merge_lse_active_rows,
     _promote_residual_microtiles,
     _select_residual_to_total_mass,
     _select_hyvideo_core_tiles,
     compute_64_tile_scores,
     select_64_tiles_from_scores,
+    select_fine_topk_from_scores,
 )
 from dfsattn.utils.timing import AttentionTimingRecorder
 from analyze_macro_topk_error import fixed_macro_topk, macro_structure
 
 
 class FlashInfer64AttentionTest(unittest.TestCase):
+    def test_per_head_occupancy_and_tau_stats_reuse_fixed_support(self) -> None:
+        micro_scores = torch.full((1, 8, 6), 1.0 / 6.0)
+        fine_indices = torch.zeros((1, 8, 2), dtype=torch.int32)
+        fine_valid = torch.ones_like(fine_indices, dtype=torch.bool)
+        occupancy = torch.tensor([[[16]]], dtype=torch.uint8)
+        occupancy_stats, tau_stats = _compute_head_occupancy_tau_stats(
+            micro_scores,
+            fine_indices,
+            fine_valid,
+            occupancy,
+            sequence=128,
+            video_len=None,
+        )
+        self.assertEqual(len(occupancy_stats), 1)
+        self.assertEqual(occupancy_stats[0]["occupancy_histogram"][16], 1)
+        self.assertEqual(occupancy_stats[0]["weighted_occupancy"], 16.0)
+        self.assertEqual(len(tau_stats), 6)
+        tau8 = next(item for item in tau_stats if item["tau"] == 8)
+        tau24 = next(item for item in tau_stats if item["tau"] == 24)
+        self.assertEqual(tau8["promoted_macro_count"], 1)
+        self.assertEqual(tau8["residual_microtiles"], 0)
+        self.assertEqual(tau24["promoted_macro_count"], 0)
+        self.assertEqual(tau24["residual_microtiles"], 16)
+
+    def test_fine_topk_occupancy_uses_uint8_and_partitions_supports(self) -> None:
+        scores = torch.zeros(1, 8, 6)
+        scores[0, :, 0] = 0.9
+        scores[0, :, 1] = 0.1
+        core, fine_indices, residual_valid, occupancy = _fine_topk_occupancy_route(
+            scores,
+            fine_top_k=2,
+            occupancy_threshold=8,
+            sequence=128,
+            video_len=None,
+        )
+        self.assertEqual(occupancy.dtype, torch.uint8)
+        self.assertEqual(int(occupancy[0, 0, 0]), 16)
+        self.assertTrue(bool(core[0, 0, 0]))
+        self.assertFalse(bool(residual_valid.any()))
+        self.assertEqual(tuple(fine_indices.shape), (1, 8, 2))
+
+    def test_fine_topk_low_occupancy_stays_in_residual(self) -> None:
+        scores = torch.zeros(1, 8, 6)
+        scores[0, :, 0] = 0.9
+        scores[0, :, 1] = 0.1
+        core, fine_indices, residual_valid, _ = _fine_topk_occupancy_route(
+            scores,
+            fine_top_k=1,
+            occupancy_threshold=9,
+            sequence=128,
+            video_len=None,
+        )
+        mask, indices, indptr, buckets, active_rows, _ = _build_residual_csr_from_fine_indices(
+            fine_indices,
+            residual_valid,
+            q_micro_blocks=8,
+            k_micro_blocks=6,
+            core_mask=core,
+            build_mask=True,
+        )
+        self.assertFalse(bool(core.any()))
+        self.assertEqual(indices.tolist(), [0] * 8)
+        self.assertEqual(indptr.tolist(), list(range(0, 9)))
+        self.assertEqual([cap for cap, _ in buckets], [4])
+        self.assertEqual(active_rows.tolist(), list(range(8)))
+        self.assertEqual(int(mask.sum()), 8)
+
+    def test_fine_topk_attention_matches_exact_union_and_has_no_empty_core_nan(self) -> None:
+        torch.manual_seed(31)
+        sequence = 129
+        q = torch.randn(1, 2, sequence, 16)
+        k, v = torch.randn_like(q), torch.randn_like(q)
+        backend = FlashInfer64Attention()
+        actual = backend(
+            q, k, v,
+            video_perm=None,
+            video_len=None,
+            route_mode="fine_topk_occupancy",
+            tile_top_p=0.25,
+            fine_top_k=2,
+            token_top_k=None,
+            token_top_ratio=0.1,
+            token_top_p=0.9,
+            promotion_threshold=48,
+            refresh_route=True,
+            reuse_route=True,
+            record_density=True,
+        )
+        route = backend.route
+        support = route.core_mask.repeat_interleave(Q_MACRO, 1).repeat_interleave(
+            K_MACRO, 2
+        )[:, :sequence, :sequence]
+        residual = route.residual_mask.repeat_interleave(MICRO, 1).repeat_interleave(
+            MICRO, 2
+        )[:, :sequence, :sequence]
+        self.assertFalse(bool((support & residual).any()))
+        logits = torch.matmul(q[0], k[0].transpose(1, 2)) / (q.shape[-1] ** 0.5)
+        union = support | residual
+        logits.masked_fill_(~union, float("-inf"))
+        expected = torch.matmul(torch.softmax(logits, -1), v[0])[None]
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
     def test_macro_structure_uses_48_way_entropy_and_boundary_valid_count(self) -> None:
         scores = torch.zeros(1, 17, 17)
         scores[0, 0, 0] = 1.0

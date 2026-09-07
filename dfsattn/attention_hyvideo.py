@@ -79,7 +79,11 @@ class DFS_Attention(nn.Module):
     density_records: Dict[int, Dict[int, float]] = {}
     # Interaction statistics for block Top-p + residual token Top-k.
     # Values are keyed by step_idx -> {layer_idx: statistics}.
-    sparsity_records: Dict[int, Dict[int, Dict[str, float]]] = {}
+    sparsity_records: Dict[int, Dict[int, Dict[str, Any]]] = {}
+    # Statistics-only outputs for the Fine Top-k occupancy experiment.  These
+    # are deliberately separate from timing_records and contain no runtime.
+    flashinfer64_head_occupancy_records: Dict[int, Dict[str, Any]] = {}
+    flashinfer64_head_tau_records: Dict[Tuple[int, int], Dict[str, Any]] = {}
     timing_recorder = AttentionTimingRecorder()
     subblock_profiler = SubblockRetentionProfiler()
 
@@ -1261,6 +1265,8 @@ class DFS_Attention(nn.Module):
         cls._cached_metadata.clear()
         cls.density_records.clear()
         cls.sparsity_records.clear()
+        cls.flashinfer64_head_occupancy_records.clear()
+        cls.flashinfer64_head_tau_records.clear()
         _flashinfer64_instances.clear()
 
     @classmethod
@@ -1298,6 +1304,164 @@ class DFS_Attention(nn.Module):
         if not cls.record_density:
             cls.density_records.clear()
             cls.sparsity_records.clear()
+            cls.flashinfer64_head_occupancy_records.clear()
+            cls.flashinfer64_head_tau_records.clear()
+
+    @classmethod
+    def record_flashinfer64_head_stats(
+        cls,
+        occupancy_stats: Tuple[Dict[str, Any], ...],
+        tau_stats: Tuple[Dict[str, Any], ...],
+    ):
+        """Accumulate per-head occupancy/tau statistics without timing data."""
+        for values in occupancy_stats:
+            head = int(values["head"])
+            record = cls.flashinfer64_head_occupancy_records.setdefault(
+                head,
+                {
+                    "calls": 0,
+                    "macro_count": 0,
+                    "histogram": [0] * 49,
+                    "mean_sum": 0.0,
+                    "p50_sum": 0.0,
+                    "p95_sum": 0.0,
+                    "max": 0.0,
+                    "weighted_sum": 0.0,
+                    "entropy_sum": 0.0,
+                },
+            )
+            record["calls"] += 1
+            record["macro_count"] += int(values["macro_count"])
+            record["histogram"] = [
+                left + int(right)
+                for left, right in zip(record["histogram"], values["occupancy_histogram"])
+            ]
+            record["mean_sum"] += float(values["mean"])
+            record["p50_sum"] += float(values["p50"])
+            record["p95_sum"] += float(values["p95"])
+            record["max"] = max(record["max"], float(values["max"]))
+            record["weighted_sum"] += float(values["weighted_occupancy"])
+            record["entropy_sum"] += float(values["fine_entropy_mean"])
+
+        for values in tau_stats:
+            key = (int(values["head"]), int(values["tau"]))
+            record = cls.flashinfer64_head_tau_records.setdefault(
+                key,
+                {
+                    "calls": 0,
+                    "promoted_sum": 0.0,
+                    "core_density_sum": 0.0,
+                    "residual_density_sum": 0.0,
+                    "residual_microtiles_sum": 0.0,
+                    "residual_row_mean_sum": 0.0,
+                    "residual_row_p50_sum": 0.0,
+                    "residual_row_p95_sum": 0.0,
+                    "residual_row_max": 0.0,
+                    "residual_row_nonempty_sum": 0.0,
+                },
+            )
+            record["calls"] += 1
+            record["promoted_sum"] += float(values["promoted_macro_count"])
+            record["core_density_sum"] += float(values["core_density"])
+            record["residual_density_sum"] += float(values["residual_density"])
+            record["residual_microtiles_sum"] += float(values["residual_microtiles"])
+            record["residual_row_mean_sum"] += float(values["residual_row_mean"])
+            record["residual_row_p50_sum"] += float(values["residual_row_p50"])
+            record["residual_row_p95_sum"] += float(values["residual_row_p95"])
+            record["residual_row_max"] = max(
+                record["residual_row_max"], float(values["residual_row_max"])
+            )
+            record["residual_row_nonempty_sum"] += float(values["residual_row_nonempty_ratio"])
+
+    @classmethod
+    def dump_flashinfer64_head_stats(cls, output_dir: str) -> Tuple[str, str]:
+        """Write the statistics-only per-head experiment CSVs."""
+        os.makedirs(output_dir, exist_ok=True)
+        occupancy_path = os.path.join(output_dir, "head_occupancy_histogram.csv")
+        tau_path = os.path.join(output_dir, "head_tau_sweep.csv")
+
+        def histogram_quantile(histogram, fraction):
+            total = sum(histogram)
+            if total <= 0:
+                return float("nan")
+            target = fraction * (total - 1)
+            lower = int(math.floor(target))
+            upper = int(math.ceil(target))
+            seen = 0
+            lower_value = upper_value = 0
+            for value, count in enumerate(histogram):
+                if seen <= lower < seen + count:
+                    lower_value = value
+                if seen <= upper < seen + count:
+                    upper_value = value
+                    break
+                seen += count
+            return (lower_value + upper_value) / 2.0
+
+        occupancy_fields = [
+            "head", "calls", "macro_count", "mean", "p50", "p95", "max",
+            "weighted_occupancy", "fine_entropy_mean",
+            "occupancy_0_7", "occupancy_8_15", "occupancy_16_23",
+            "occupancy_24_31", "occupancy_32_39", "occupancy_40_48",
+            *[f"occupancy_{index}" for index in range(49)],
+        ]
+        with open(occupancy_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=occupancy_fields)
+            writer.writeheader()
+            for head in sorted(cls.flashinfer64_head_occupancy_records):
+                values = cls.flashinfer64_head_occupancy_records[head]
+                calls = max(1, values["calls"])
+                histogram = values["histogram"]
+                total = max(1, sum(histogram))
+                weighted_denominator = sum(index * count for index, count in enumerate(histogram))
+                row = {
+                    "head": head,
+                    "calls": values["calls"],
+                    "macro_count": values["macro_count"],
+                    "mean": sum(index * count for index, count in enumerate(histogram)) / total,
+                    "p50": histogram_quantile(histogram, 0.50),
+                    "p95": histogram_quantile(histogram, 0.95),
+                    "max": values["max"],
+                    "weighted_occupancy": (
+                        sum(index * index * count for index, count in enumerate(histogram))
+                        / max(1, weighted_denominator)
+                    ),
+                    "fine_entropy_mean": values["entropy_sum"] / calls,
+                }
+                for start, end in ((0, 7), (8, 15), (16, 23), (24, 31), (32, 39), (40, 48)):
+                    row[f"occupancy_{start}_{end}"] = sum(histogram[start:end + 1])
+                row.update({f"occupancy_{index}": count for index, count in enumerate(histogram)})
+                writer.writerow(row)
+
+        tau_fields = [
+            "head", "tau", "calls", "promoted_macro_count_mean",
+            "core_density_mean", "residual_density_mean", "residual_microtiles_mean",
+            "residual_row_mean", "residual_row_p50", "residual_row_p95",
+            "residual_row_max", "residual_row_nonempty_ratio",
+        ]
+        with open(tau_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=tau_fields)
+            writer.writeheader()
+            for (head, tau) in sorted(cls.flashinfer64_head_tau_records):
+                values = cls.flashinfer64_head_tau_records[(head, tau)]
+                calls = max(1, values["calls"])
+                writer.writerow({
+                    "head": head,
+                    "tau": tau,
+                    "calls": values["calls"],
+                    "promoted_macro_count_mean": values["promoted_sum"] / calls,
+                    "core_density_mean": values["core_density_sum"] / calls,
+                    "residual_density_mean": values["residual_density_sum"] / calls,
+                    "residual_microtiles_mean": values["residual_microtiles_sum"] / calls,
+                    "residual_row_mean": values["residual_row_mean_sum"] / calls,
+                    "residual_row_p50": values["residual_row_p50_sum"] / calls,
+                    "residual_row_p95": values["residual_row_p95_sum"] / calls,
+                    "residual_row_max": values["residual_row_max"],
+                    "residual_row_nonempty_ratio": values["residual_row_nonempty_sum"] / calls,
+                })
+        logger.info("Per-head occupancy statistics saved to {}", occupancy_path)
+        logger.info("Per-head tau sweep statistics saved to {}", tau_path)
+        return occupancy_path, tau_path
 
     @classmethod
     def set_record_timing(cls, enabled: bool):
@@ -1359,6 +1523,9 @@ class DFS_Attention(nn.Module):
                 metric_fields = [
                     "residual_count_mean", "residual_count_p50", "residual_count_p95",
                     "residual_count_max", "residual_count_nonempty_ratio",
+                    "fine_top_k", "occupancy_threshold", "occupancy_mean",
+                    "fine_top_ratio",
+                    "occupancy_histogram",
                 ]
                 writer = csv.DictWriter(
                     f, fieldnames=["step_idx", "layer_idx", "density", *metric_fields]
@@ -1447,6 +1614,24 @@ class DFS_Attention(nn.Module):
             summary[f"mean_{metric}"] = (
                 sum(metric_values) / len(metric_values) if metric_values else float("nan")
             )
+        for metric in ("fine_top_k", "fine_top_ratio", "occupancy_threshold", "occupancy_mean"):
+            metric_values = [
+                float(values[metric]) for values in sparse_values
+                if metric in values and math.isfinite(float(values[metric]))
+            ]
+            summary[f"mean_{metric}"] = (
+                sum(metric_values) / len(metric_values) if metric_values else float("nan")
+            )
+        histograms = [
+            values.get("occupancy_histogram")
+            for values in sparse_values
+            if values.get("occupancy_histogram")
+        ]
+        if histograms:
+            summary["occupancy_histogram"] = tuple(
+                sum(int(histogram[index]) for histogram in histograms)
+                for index in range(49)
+            )
         if output_path is not None:
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
             fieldnames = list(summary.keys())
@@ -1503,6 +1688,8 @@ class DFS_Attention(nn.Module):
                 "promoted_macro_tiles",
                 "residual_count_mean", "residual_count_p50", "residual_count_p95",
                 "residual_count_max", "residual_count_nonempty_ratio",
+                "fine_top_k", "fine_top_ratio", "occupancy_threshold", "occupancy_mean",
+                "occupancy_histogram",
                 "final_density", "final_hybrid_sparsity",
             ]
             with open(output_path, "w", newline="") as f:
@@ -1559,6 +1746,8 @@ def dfs_attention(
     flashinfer64_token_top_ratio: float = 0.10,
     flashinfer64_route_mode: str = "topk_topp",
     flashinfer64_tile_top_ratio: float = 0.25,
+    flashinfer64_fine_top_ratio: float = 0.2,
+    flashinfer64_fine_top_k: Optional[int] = None,
     flashinfer64_token_top_p: float = 0.9,
     flashinfer64_promotion_threshold: int = 24,
     flashinfer64_route_cache: bool = False,
@@ -1617,6 +1806,8 @@ def dfs_attention(
             route_mode=flashinfer64_route_mode,
             tile_top_p=flashinfer64_top_p,
             tile_top_ratio=flashinfer64_tile_top_ratio,
+            fine_top_ratio=flashinfer64_fine_top_ratio,
+            fine_top_k=flashinfer64_fine_top_k,
             token_top_k=flashinfer64_token_top_k,
             token_top_ratio=flashinfer64_token_top_ratio,
             token_top_p=flashinfer64_token_top_p,
@@ -1656,6 +1847,11 @@ def dfs_attention(
                 "residual_token_interactions": float(stats["residual_token_interactions"]),
                 "residual_micro_tiles": float(stats.get("residual_micro_tiles", 0)),
                 "promoted_macro_tiles": float(stats.get("promoted_macro_tiles", 0)),
+                "fine_top_k": float(stats.get("fine_top_k", float("nan"))),
+                "fine_top_ratio": float(flashinfer64_fine_top_ratio),
+                "occupancy_threshold": float(stats.get("occupancy_threshold", float("nan"))),
+                "occupancy_mean": float(stats.get("occupancy_mean", float("nan"))),
+                "occupancy_histogram": stats.get("occupancy_histogram", ""),
                 "residual_count_mean": float(stats.get("residual_count_mean", float("nan"))),
                 "residual_count_p50": float(stats.get("residual_count_p50", float("nan"))),
                 "residual_count_p95": float(stats.get("residual_count_p95", float("nan"))),
@@ -1664,6 +1860,14 @@ def dfs_attention(
                 "final_density": final_density,
                 "final_hybrid_sparsity": 1.0 - final_density,
             }
+            # A cached route is one structural sample; do not count the
+            # following cache-hit executions repeatedly in the per-head CSVs.
+            # This path records only occupancy/tau structure, never runtime.
+            if (not flashinfer64_route_cache) or is_cache_step:
+                DFS_Attention.record_flashinfer64_head_stats(
+                    stats.get("head_occupancy_stats", ()),
+                    stats.get("head_tau_stats", ()),
+                )
         return output
 
     instance_key = layer_idx

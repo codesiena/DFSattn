@@ -59,6 +59,8 @@ class HunyuanVideo_DFSAttn_Processor2_0:
         flashinfer64_token_top_ratio=0.10,
         flashinfer64_route_mode="topk_topp",
         flashinfer64_tile_top_ratio=0.25,
+        flashinfer64_fine_top_ratio=0.2,
+        flashinfer64_fine_top_k=None,
         flashinfer64_token_top_p=0.9,
         flashinfer64_promotion_threshold=24,
         flashinfer64_route_cache=False,
@@ -98,6 +100,8 @@ class HunyuanVideo_DFSAttn_Processor2_0:
         self.flashinfer64_token_top_ratio = flashinfer64_token_top_ratio
         self.flashinfer64_route_mode = flashinfer64_route_mode
         self.flashinfer64_tile_top_ratio = flashinfer64_tile_top_ratio
+        self.flashinfer64_fine_top_ratio = flashinfer64_fine_top_ratio
+        self.flashinfer64_fine_top_k = flashinfer64_fine_top_k
         self.flashinfer64_token_top_p = flashinfer64_token_top_p
         self.flashinfer64_promotion_threshold = flashinfer64_promotion_threshold
         self.flashinfer64_route_cache = flashinfer64_route_cache
@@ -160,6 +164,8 @@ class HunyuanVideo_DFSAttn_Processor2_0:
             summary.update({
                 "flashinfer64_route_mode": self.flashinfer64_route_mode,
                 "flashinfer64_tile_top_ratio": float(self.flashinfer64_tile_top_ratio),
+                "flashinfer64_fine_top_ratio": float(self.flashinfer64_fine_top_ratio),
+                "flashinfer64_fine_top_k": self.flashinfer64_fine_top_k,
                 "flashinfer64_token_top_p": float(self.flashinfer64_token_top_p),
                 "flashinfer64_core_only": bool(self.flashinfer64_core_only),
                 "flashinfer64_promotion_threshold": int(self.flashinfer64_promotion_threshold),
@@ -322,6 +328,8 @@ class HunyuanVideo_DFSAttn_Processor2_0:
                     flashinfer64_token_top_ratio=self.flashinfer64_token_top_ratio,
                     flashinfer64_route_mode=self.flashinfer64_route_mode,
                     flashinfer64_tile_top_ratio=self.flashinfer64_tile_top_ratio,
+                    flashinfer64_fine_top_ratio=self.flashinfer64_fine_top_ratio,
+                    flashinfer64_fine_top_k=self.flashinfer64_fine_top_k,
                     flashinfer64_token_top_p=self.flashinfer64_token_top_p,
                     flashinfer64_promotion_threshold=self.flashinfer64_promotion_threshold,
                     flashinfer64_route_cache=self.flashinfer64_route_cache,

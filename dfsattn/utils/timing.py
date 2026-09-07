@@ -115,8 +115,11 @@ class AttentionTimingRecorder:
         detailed_phases = (
             "flashinfer_qkv_permute",
             "flashinfer_fine_score",
+            "flashinfer_fine_topk",
             "flashinfer_core_score",
             "flashinfer_core_select",
+            "flashinfer_occupancy",
+            "flashinfer_partition",
             "flashinfer_residual_select",
             "flashinfer_promotion",
             "flashinfer_residual_compact",
@@ -163,6 +166,7 @@ class AttentionTimingRecorder:
         metric_fields = (
             "residual_count_mean", "residual_count_p50", "residual_count_p95",
             "residual_count_max", "residual_count_nonempty_ratio",
+            "fine_top_k", "occupancy_threshold", "occupancy_mean",
         )
         with open(output_path, "w", newline="") as handle:
             writer = csv.DictWriter(
