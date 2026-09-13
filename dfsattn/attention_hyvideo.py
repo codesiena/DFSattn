@@ -65,6 +65,32 @@ def _compute_cache_schedule(
     return is_cache_step, current_sparsity
 
 
+def _compute_flashinfer64_tile_schedule(
+    step_idx: int,
+    skip_steps: int,
+    cache_interval: int,
+    tile_top_ratio: float,
+    sparsity_dcrt: float,
+    dynamic_tile_ratio: bool,
+) -> Tuple[bool, float]:
+    """Return the route-refresh flag and effective macro Top-k ratio."""
+    if dynamic_tile_ratio:
+        return _compute_cache_schedule(
+            step_idx,
+            skip_steps,
+            cache_interval,
+            tile_top_ratio,
+            sparsity_dcrt,
+        )
+    if cache_interval <= 0:
+        raise ValueError("cache_interval must be greater than 0.")
+    is_cache_step = (
+        step_idx >= skip_steps
+        and (step_idx - skip_steps) % cache_interval == 0
+    )
+    return is_cache_step, tile_top_ratio
+
+
 class DFS_Attention(nn.Module):
     # Mask granularity is part of the cache identity. Native uses 128x128,
     # while Hybrid consumes the same selector at 16x16.
@@ -1746,10 +1772,16 @@ def dfs_attention(
     flashinfer64_token_top_ratio: float = 0.10,
     flashinfer64_route_mode: str = "topk_topp",
     flashinfer64_tile_top_ratio: float = 0.25,
+    flashinfer64_dynamic_tile_ratio: bool = False,
     flashinfer64_fine_top_ratio: float = 0.2,
     flashinfer64_fine_top_k: Optional[int] = None,
     flashinfer64_token_top_p: float = 0.9,
     flashinfer64_promotion_threshold: int = 24,
+    flashinfer64_dense_layer: int = -1,
+    flashinfer64_dense_heads=(),
+    flashinfer64_high_omission_heads_file: Optional[str] = None,
+    flashinfer64_residual_scorer: str = "proxy",
+    flashinfer64_residual_temperature: float = 1.0,
     flashinfer64_route_cache: bool = False,
     flashinfer64_core_only: bool = False,
     flashinfer64_direct_macro_csr: bool = True,
@@ -1782,19 +1814,22 @@ def dfs_attention(
     Returns:
         torch.Tensor: Output tensor with shape [B, H, L, D]
     """
-    
+
     if sparse_execution == "flashinfer64":
         backend = _flashinfer64_instances.setdefault(layer_idx, FlashInfer64Attention())
         if record_density and not DFS_Attention.record_density:
             DFS_Attention.set_record_density(True)
-        if cache_interval <= 0:
-            raise ValueError("cache_interval must be greater than 0.")
-        # FlashInfer64 has fixed Top-p/Top-k-ratio parameters and therefore
-        # must not inherit native DFSAttn's sparsity_dcrt schedule cutoff.
-        # Refresh exactly every cache_interval sparse steps.
-        is_cache_step = (
-            step_idx >= skip_steps
-            and (step_idx - skip_steps) % cache_interval == 0
+        if flashinfer64_dynamic_tile_ratio and flashinfer64_route_mode != "topk_topp":
+            raise ValueError(
+                "flashinfer64_dynamic_tile_ratio is only supported by topk_topp."
+            )
+        is_cache_step, effective_tile_top_ratio = _compute_flashinfer64_tile_schedule(
+            step_idx=step_idx,
+            skip_steps=skip_steps,
+            cache_interval=cache_interval,
+            tile_top_ratio=flashinfer64_tile_top_ratio,
+            sparsity_dcrt=sparsity_dcrt,
+            dynamic_tile_ratio=flashinfer64_dynamic_tile_ratio,
         )
         attention_start = DFS_Attention.timing_recorder.start(q.device)
         output = backend(
@@ -1805,13 +1840,18 @@ def dfs_attention(
             video_len=video_len,
             route_mode=flashinfer64_route_mode,
             tile_top_p=flashinfer64_top_p,
-            tile_top_ratio=flashinfer64_tile_top_ratio,
+            tile_top_ratio=effective_tile_top_ratio,
             fine_top_ratio=flashinfer64_fine_top_ratio,
             fine_top_k=flashinfer64_fine_top_k,
             token_top_k=flashinfer64_token_top_k,
             token_top_ratio=flashinfer64_token_top_ratio,
             token_top_p=flashinfer64_token_top_p,
             promotion_threshold=flashinfer64_promotion_threshold,
+            dense_layer=flashinfer64_dense_layer,
+            dense_heads=flashinfer64_dense_heads,
+            high_omission_heads_file=flashinfer64_high_omission_heads_file,
+            residual_scorer=flashinfer64_residual_scorer,
+            residual_temperature=flashinfer64_residual_temperature,
             reuse_route=flashinfer64_route_cache,
             core_only=flashinfer64_core_only,
             direct_macro_csr=flashinfer64_direct_macro_csr,
@@ -1840,7 +1880,7 @@ def dfs_attention(
                 "p_mass": float(flashinfer64_top_p) if flashinfer64_route_mode == "topp_topk" else float("nan"),
                 "fine_top_p": float(flashinfer64_token_top_p),
                 "token_top_k": float(-1),
-                "token_top_ratio": float(flashinfer64_tile_top_ratio) if flashinfer64_route_mode == "topk_topp" else float(flashinfer64_token_top_ratio),
+                "token_top_ratio": float(effective_tile_top_ratio) if flashinfer64_route_mode == "topk_topp" else float(flashinfer64_token_top_ratio),
                 "residual_candidate_blocks": float("nan"),
                 "block_density": core_density,
                 "realized_block_sparsity": 1.0 - core_density,

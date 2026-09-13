@@ -76,10 +76,16 @@ def parse_args():
     parser.add_argument("--flashinfer64_token_top_ratio", type=float, default=0.10, help="Deprecated compatibility field; the new Residual uses micro Top-p.")
     parser.add_argument("--flashinfer64_route_mode", choices=["topp_topk", "topk_topp", "fine_topk_occupancy"], default="fine_topk_occupancy", help="Old macro Top-p/Top-k routes, or the new Fine Top-k plus uint8 macro occupancy route.")
     parser.add_argument("--flashinfer64_tile_top_ratio", type=float, default=0.25, help="Fraction of K96 macro tiles selected for each head/Q128 in topk_topp mode.")
+    parser.add_argument("--flashinfer64_dynamic_tile_ratio", type=str2bool, default=False, help="Apply native DFSAttn's diffusion-step schedule to the topk_topp macro ratio: subtract --sparsity_dcrt every --cache_interval.")
     parser.add_argument("--flashinfer64_fine_top_ratio", type=float, default=0.2, help="Fraction of K16 tiles selected per (head,Q16) by the new fine_topk_occupancy route.")
     parser.add_argument("--flashinfer64_fine_top_k", type=int, default=None, help="Deprecated compatibility override: fixed number of K16 tiles instead of --flashinfer64_fine_top_ratio.")
     parser.add_argument("--flashinfer64_token_top_p", type=float, default=0.9, help="Target total Q16/K16 proxy mass covered by Core plus Residual; rejected mass is not renormalized.")
     parser.add_argument("--flashinfer64_promotion_threshold", type=int, default=24, help="Promote a Q128xK96 tile when at least this many of its 48 Q16xK16 microtiles are selected.")
+    parser.add_argument("--flashinfer64_dense_layer", type=int, default=-1, help="For the topp_topk route only, make the listed heads at this layer fully dense (-1 disables the override).")
+    parser.add_argument("--flashinfer64_dense_heads", type=parse_mask_heads, default=(), help="For --flashinfer64_dense_layer, comma-separated heads to run densely, or 'all'.")
+    parser.add_argument("--flashinfer64_high_omission_heads_file", type=str, default=None, help="Editable 0-based Layer/Head file for hierarchical Residual checks (default: importanthead/high_omission_heads.txt).")
+    parser.add_argument("--flashinfer64_residual_scorer", choices=["proxy", "sampled_lse"], default="proxy", help="Residual scorer for configured high-omission heads: existing mean proxy or method sampled-LSE.")
+    parser.add_argument("--flashinfer64_residual_temperature", type=float, default=1.0, help="Temperature for the sampled-LSE Residual scorer (default: 1.0).")
     parser.add_argument("--flashinfer64_route_cache", type=str2bool, default=False, help="Reuse compact routes across cache intervals. With direct macro CSR this also reuses each layer's FA3 scheduler plan; False rebuilds routes/plans in bounded-memory mode.")
     parser.add_argument("--flashinfer64_core_only", type=str2bool, default=False, help="Ablation: run only macro Q128xK96 Core and skip Residual/promotion/LSE merge.")
     parser.add_argument("--flashinfer64_direct_macro_csr", type=str2bool, default=True, help="Cache a compact per-layer macro-CSR FA3 plan and bypass repeated VariableBlock token expansion/planning.")
@@ -99,6 +105,7 @@ def parse_args():
     parser.add_argument("--timing_csv", type=str, default=None, help="CSV path for video-level timing totals (default: timing.csv beside output_file)")
     parser.add_argument("--attention_debug_dir", type=str, default=None, help="Dump exact Q/K/V, sparse output, and same-input dense output at the first sparse step.")
     parser.add_argument("--attention_debug_step", type=int, default=-1, help="Diffusion step to dump (-1 means --skip_steps).")
+    parser.add_argument("--attention_debug_steps", type=parse_layer_indices, default=None, help="Optional comma-separated diffusion steps to dump in one run; overrides --attention_debug_step.")
     parser.add_argument("--attention_debug_layers", type=parse_layer_indices, default=(0,), help="Comma-separated layers to dump; layer 0 is the first meaningful divergence point.")
     parser.add_argument("--attention_debug_stop", type=str2bool, default=True, help="Stop cleanly after dumping the highest requested layer.")
     parser.add_argument("--block_mask_dir", type=str, default=None, help="Root directory for top-k masks; a prompt-number/text subdirectory is created automatically")
@@ -135,10 +142,16 @@ def parse_args():
         parser.error("--flashinfer64_token_top_ratio must be in (0, 1].")
     if not 0.0 < args.flashinfer64_tile_top_ratio <= 1.0:
         parser.error("--flashinfer64_tile_top_ratio must be in (0, 1].")
+    if args.flashinfer64_dynamic_tile_ratio and args.flashinfer64_route_mode != "topk_topp":
+        parser.error("--flashinfer64_dynamic_tile_ratio requires --flashinfer64_route_mode topk_topp.")
     if not 0.0 <= args.flashinfer64_token_top_p <= 1.0:
         parser.error("--flashinfer64_token_top_p must be in [0, 1].")
+    if args.flashinfer64_residual_temperature <= 0:
+        parser.error("--flashinfer64_residual_temperature must be positive.")
     if not 1 <= args.flashinfer64_promotion_threshold <= 48:
         parser.error("--flashinfer64_promotion_threshold must be in [1, 48].")
+    if args.flashinfer64_dense_layer < -1:
+        parser.error("--flashinfer64_dense_layer must be -1 or a non-negative layer index.")
     if args.selector_mode == "kp" and args.block_top_p is not None:
         parser.error("--selector_mode kp uses coarse Top-k and cannot be combined with --block_top_p.")
     if args.selector_mode == "kp" and args.token_top_k > 0:
@@ -255,10 +268,16 @@ if __name__ == "__main__":
                 args.flashinfer64_token_top_ratio,
                 args.flashinfer64_route_mode,
                 args.flashinfer64_tile_top_ratio,
+                args.flashinfer64_dynamic_tile_ratio,
                 args.flashinfer64_fine_top_ratio,
                 args.flashinfer64_fine_top_k,
                 args.flashinfer64_token_top_p,
                 args.flashinfer64_promotion_threshold,
+                args.flashinfer64_dense_layer,
+                args.flashinfer64_dense_heads,
+                args.flashinfer64_high_omission_heads_file,
+                args.flashinfer64_residual_scorer,
+                args.flashinfer64_residual_temperature,
                 args.flashinfer64_route_cache,
                 args.flashinfer64_core_only,
                 args.flashinfer64_direct_macro_csr,
@@ -266,6 +285,7 @@ if __name__ == "__main__":
                 args.attention_debug_step,
                 args.attention_debug_layers,
                 args.attention_debug_stop,
+                args.attention_debug_steps,
             )
             processors_id += 1   
     transformer.set_attn_processor(attn_processors)
@@ -347,14 +367,11 @@ if __name__ == "__main__":
 
     if args.record_density:
         output_dir = os.path.dirname(args.output_file) or "."
-        DFS_Attention.dump_density_records(os.path.join(output_dir, "density_records.csv"))
         DFS_Attention.dump_density_summary(
             os.path.join(output_dir, "density_summary.csv"),
             prompt_idx=args.prompt_idx,
             prompt=args.prompt,
         )
-        DFS_Attention.dump_sparsity_records(os.path.join(output_dir, "sparsity_records.csv"))
-        DFS_Attention.dump_flashinfer64_head_stats(output_dir)
 
     export_to_video(output, args.output_file, fps=24)
 

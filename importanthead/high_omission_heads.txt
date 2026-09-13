@@ -1,0 +1,8 @@
+# 0-based Layer/Head risk prior for the topp_topk/topk_topp routes.
+# Only these pairs receive the Q16/K16 Residual check.  One entry per line:
+# Layer<layer> / Head<head>
+Layer43 / Head17
+Layer30 / Head13
+Layer48 / Head5
+Layer8  / Head10
+Layer12 / Head5

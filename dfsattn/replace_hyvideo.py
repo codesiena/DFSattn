@@ -59,10 +59,16 @@ class HunyuanVideo_DFSAttn_Processor2_0:
         flashinfer64_token_top_ratio=0.10,
         flashinfer64_route_mode="topk_topp",
         flashinfer64_tile_top_ratio=0.25,
+        flashinfer64_dynamic_tile_ratio=False,
         flashinfer64_fine_top_ratio=0.2,
         flashinfer64_fine_top_k=None,
         flashinfer64_token_top_p=0.9,
         flashinfer64_promotion_threshold=24,
+        flashinfer64_dense_layer=-1,
+        flashinfer64_dense_heads=(),
+        flashinfer64_high_omission_heads_file=None,
+        flashinfer64_residual_scorer="proxy",
+        flashinfer64_residual_temperature=1.0,
         flashinfer64_route_cache=False,
         flashinfer64_core_only=False,
         flashinfer64_direct_macro_csr=True,
@@ -70,6 +76,7 @@ class HunyuanVideo_DFSAttn_Processor2_0:
         attention_debug_step=-1,
         attention_debug_layers=(0,),
         attention_debug_stop=True,
+        attention_debug_steps=None,
     ):
         self.mode = mode
         self.sparsity = sparsity
@@ -100,17 +107,29 @@ class HunyuanVideo_DFSAttn_Processor2_0:
         self.flashinfer64_token_top_ratio = flashinfer64_token_top_ratio
         self.flashinfer64_route_mode = flashinfer64_route_mode
         self.flashinfer64_tile_top_ratio = flashinfer64_tile_top_ratio
+        self.flashinfer64_dynamic_tile_ratio = flashinfer64_dynamic_tile_ratio
         self.flashinfer64_fine_top_ratio = flashinfer64_fine_top_ratio
         self.flashinfer64_fine_top_k = flashinfer64_fine_top_k
         self.flashinfer64_token_top_p = flashinfer64_token_top_p
         self.flashinfer64_promotion_threshold = flashinfer64_promotion_threshold
+        self.flashinfer64_dense_layer = flashinfer64_dense_layer
+        self.flashinfer64_dense_heads = flashinfer64_dense_heads
+        self.flashinfer64_high_omission_heads_file = flashinfer64_high_omission_heads_file
+        self.flashinfer64_residual_scorer = flashinfer64_residual_scorer
+        self.flashinfer64_residual_temperature = flashinfer64_residual_temperature
         self.flashinfer64_route_cache = flashinfer64_route_cache
         self.flashinfer64_core_only = flashinfer64_core_only
         self.flashinfer64_direct_macro_csr = flashinfer64_direct_macro_csr
         self.attention_debug_dir = attention_debug_dir
-        self.attention_debug_step = (
-            skip_steps if attention_debug_step < 0 else attention_debug_step
+        resolved_debug_step = skip_steps if attention_debug_step < 0 else attention_debug_step
+        self.attention_debug_steps = (
+            (resolved_debug_step,)
+            if attention_debug_steps is None
+            else tuple(dict.fromkeys(int(step) for step in attention_debug_steps))
         )
+        if not self.attention_debug_steps or any(step < 0 for step in self.attention_debug_steps):
+            raise ValueError("attention_debug_steps must contain non-negative steps")
+        self.attention_debug_step = self.attention_debug_steps[0]
         self.attention_debug_layers = tuple(attention_debug_layers)
         self.attention_debug_stop = bool(attention_debug_stop)
 
@@ -169,6 +188,11 @@ class HunyuanVideo_DFSAttn_Processor2_0:
                 "flashinfer64_token_top_p": float(self.flashinfer64_token_top_p),
                 "flashinfer64_core_only": bool(self.flashinfer64_core_only),
                 "flashinfer64_promotion_threshold": int(self.flashinfer64_promotion_threshold),
+                "flashinfer64_dense_layer": int(self.flashinfer64_dense_layer),
+                "flashinfer64_dense_heads": (
+                    None if self.flashinfer64_dense_heads is None
+                    else [int(head) for head in self.flashinfer64_dense_heads]
+                ),
             })
         del diff, dense_norm, per_head_mean, per_head_max
 
@@ -328,10 +352,16 @@ class HunyuanVideo_DFSAttn_Processor2_0:
                     flashinfer64_token_top_ratio=self.flashinfer64_token_top_ratio,
                     flashinfer64_route_mode=self.flashinfer64_route_mode,
                     flashinfer64_tile_top_ratio=self.flashinfer64_tile_top_ratio,
+                    flashinfer64_dynamic_tile_ratio=self.flashinfer64_dynamic_tile_ratio,
                     flashinfer64_fine_top_ratio=self.flashinfer64_fine_top_ratio,
                     flashinfer64_fine_top_k=self.flashinfer64_fine_top_k,
                     flashinfer64_token_top_p=self.flashinfer64_token_top_p,
                     flashinfer64_promotion_threshold=self.flashinfer64_promotion_threshold,
+                    flashinfer64_dense_layer=self.flashinfer64_dense_layer,
+                    flashinfer64_dense_heads=self.flashinfer64_dense_heads,
+                    flashinfer64_high_omission_heads_file=self.flashinfer64_high_omission_heads_file,
+                    flashinfer64_residual_scorer=self.flashinfer64_residual_scorer,
+                    flashinfer64_residual_temperature=self.flashinfer64_residual_temperature,
                     flashinfer64_route_cache=self.flashinfer64_route_cache,
                     flashinfer64_core_only=self.flashinfer64_core_only,
                     flashinfer64_direct_macro_csr=self.flashinfer64_direct_macro_csr,
@@ -364,7 +394,7 @@ class HunyuanVideo_DFSAttn_Processor2_0:
         debug_this_attention = (
             ran_sparse_attention
             and self.attention_debug_dir is not None
-            and self.step_idx == self.attention_debug_step
+            and self.step_idx in self.attention_debug_steps
             and self.layer_idx in self.attention_debug_layers
         )
         if debug_this_attention:
@@ -396,6 +426,7 @@ class HunyuanVideo_DFSAttn_Processor2_0:
             del dense_debug_output
             if (
                 self.attention_debug_stop
+                and self.step_idx == max(self.attention_debug_steps)
                 and self.layer_idx == max(self.attention_debug_layers)
             ):
                 raise AttentionDebugComplete(

@@ -722,7 +722,7 @@ def dfs_attention(
     Returns:
         torch.Tensor: Output tensor with shape [B, H, L, D]
     """
-    
+
     if sparse_execution == "flashinfer64":
         backend = _flashinfer64_instances.setdefault(layer_idx, FlashInfer64Attention())
         if record_density and not DFS_Attention.record_density:

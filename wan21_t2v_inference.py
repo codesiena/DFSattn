@@ -240,9 +240,4 @@ if __name__ == "__main__":
 
     export_to_video(output, args.output_file, fps=24)
 
-    if args.record_density:
-        output_dir = os.path.dirname(args.output_file) or "."
-        density_path = args.density_csv or os.path.join(output_dir, "density_records.csv")
-        DFS_Attention.dump_density_records(density_path)
-
     

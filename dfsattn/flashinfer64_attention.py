@@ -9,8 +9,10 @@ exact LSE merge, optional compact-route reuse, and cached per-layer FA3 plans.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import math
 import os
+import re
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -49,6 +51,11 @@ except ImportError:  # pragma: no cover
     triton = None
     tl = None
 
+try:
+    from .rode_backend import load_rode_extension
+except ImportError:  # pragma: no cover
+    load_rode_extension = None
+
 
 Q_MACRO = 128
 K_MACRO = 96
@@ -67,6 +74,146 @@ _shared_core_workspace: Optional[torch.Tensor] = None
 _shared_core_signature = None
 _shared_direct_vector_indices: Optional[torch.Tensor] = None
 _shared_direct_pin_workspace: Optional[torch.Tensor] = None
+_replay_mask_cache: dict[str, tuple[float, dict[str, list[list[int]]]]] = {}
+_high_omission_heads_cache: dict[
+    str, tuple[tuple[int, int], dict[int, tuple[int, ...]]]
+] = {}
+
+_HIGH_OMISSION_HEAD_LINE = re.compile(
+    r"^\s*Layer\s*(\d+)\s*/\s*Head\s*(\d+)\s*(?:#.*)?$",
+    re.IGNORECASE,
+)
+
+
+def _default_high_omission_heads_file() -> str:
+    return os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__), "..", "importanthead",
+            "high_omission_heads.txt",
+        )
+    )
+
+
+def _load_high_omission_heads(path: Optional[str] = None):
+    """Load the editable Layer/Head risk prior used by hierarchical routes.
+
+    The file intentionally uses the same 0-based Layer/Head numbering as the
+    model code.  It is re-read when its mtime/size changes so an experiment
+    can update the prior without restarting the Python process.
+    """
+    selected_path = path or os.environ.get("FLASHINFER64_HIGH_OMISSION_HEADS_FILE")
+    selected_path = os.path.abspath(selected_path or _default_high_omission_heads_file())
+    try:
+        stat = os.stat(selected_path)
+    except OSError as exc:
+        raise FileNotFoundError(
+            "high-omission head file not found: " + selected_path
+        ) from exc
+    fingerprint = (stat.st_mtime_ns, stat.st_size)
+    cached = _high_omission_heads_cache.get(selected_path)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1], (selected_path, *fingerprint)
+
+    by_layer: dict[int, set[int]] = {}
+    with open(selected_path, "r", encoding="utf-8") as handle:
+        for line_no, raw_line in enumerate(handle, 1):
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            match = _HIGH_OMISSION_HEAD_LINE.fullmatch(line)
+            if match is None:
+                raise ValueError(
+                    f"invalid high-omission head entry at {selected_path}:{line_no}; "
+                    "expected 'Layer<integer> / Head<integer>'"
+                )
+            layer, head = (int(value) for value in match.groups())
+            if layer < 0 or head < 0:
+                raise ValueError(
+                    f"Layer/Head indices must be non-negative at "
+                    f"{selected_path}:{line_no}"
+                )
+            by_layer.setdefault(layer, set()).add(head)
+    normalized = {
+        layer: tuple(sorted(heads)) for layer, heads in sorted(by_layer.items())
+    }
+    _high_omission_heads_cache[selected_path] = (fingerprint, normalized)
+    return normalized, (selected_path, *fingerprint)
+
+
+def _load_replay_mask(path: str) -> dict[str, list[list[int]]]:
+    """Load a prompt-specific Q16/K16 replay mask once per process."""
+    if not path:
+        return {}
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError as exc:
+        raise FileNotFoundError(
+            f"FLASHINFER64_REPLAY_MASK_FILE not found: {path}"
+        ) from exc
+    cached = _replay_mask_cache.get(path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    rows = payload.get("rows", payload)
+    if not isinstance(rows, dict):
+        raise ValueError(f"Replay mask must be a JSON object: {path}")
+    normalized: dict[str, list[list[int]]] = {}
+    for key, values in rows.items():
+        if not isinstance(values, list):
+            raise ValueError(f"Replay mask rows for {key} must be a list: {path}")
+        normalized[str(key)] = [
+            [int(item[0]), int(item[1]), int(item[2])]
+            for item in values
+            if isinstance(item, (list, tuple)) and len(item) == 3
+        ]
+    _replay_mask_cache[path] = (mtime, normalized)
+    return normalized
+
+
+def _replay_residual_mask(
+    micro_scores: torch.Tensor,
+    core_mask: torch.Tensor,
+    *,
+    replay_file: str,
+    step_idx: int,
+    layer_idx: int,
+) -> torch.Tensor:
+    """Replay the latest available anchor mask and remove current-Core overlap.
+
+    Replay masks are measured only at sparse anchor steps (currently 12/24/36),
+    while the no-cache main route is rebuilt from the current Q/K on every
+    diffusion step.  Holding only the external add-back coordinates until the
+    next anchor keeps that main routing policy unchanged.
+    """
+    mask = torch.zeros_like(micro_scores, dtype=torch.bool)
+    replay_rows = _load_replay_mask(replay_file)
+    rows = replay_rows.get(f"{step_idx}:{layer_idx}")
+    if rows is None:
+        anchors = []
+        for key, candidate_rows in replay_rows.items():
+            try:
+                anchor_step_text, anchor_layer_text = key.split(":", 1)
+                anchor_step = int(anchor_step_text)
+                anchor_layer = int(anchor_layer_text)
+            except (TypeError, ValueError):
+                continue
+            if anchor_layer == layer_idx and anchor_step <= step_idx:
+                anchors.append((anchor_step, candidate_rows))
+        rows = max(anchors, key=lambda item: item[0])[1] if anchors else ()
+    heads, q_blocks, k_blocks = micro_scores.shape
+    for head, q16, k16 in rows:
+        if 0 <= head < heads and 0 <= q16 < q_blocks and k16 == -1:
+            # A negative K16 sentinel denotes full-row add-back.  The current
+            # Core mask is removed below, so this remains a residual-only
+            # intervention and never changes the main Core selector.
+            mask[head, q16, :] = True
+        elif 0 <= head < heads and 0 <= q16 < q_blocks and 0 <= k16 < k_blocks:
+            mask[head, q16, k16] = True
+    q_parent = torch.arange(q_blocks, device=core_mask.device) // Q_MICROS_PER_MACRO
+    k_parent = torch.arange(k_blocks, device=core_mask.device) // K_MICROS_PER_MACRO
+    selected_core = core_mask[:, q_parent[:, None], k_parent[None, :]]
+    return mask & ~selected_core
 
 
 @dataclass
@@ -158,6 +305,75 @@ def compute_micro_tile_scores(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
     qm, km = _block_means(q, MICRO), _block_means(k, MICRO)
     logits = torch.bmm(qm, km.transpose(1, 2)).float() * (q.shape[-1] ** -0.5)
     return torch.softmax(logits, dim=-1)
+
+
+def _block_representatives(x: torch.Tensor, block: int = MICRO) -> torch.Tensor:
+    """Return mean + three largest-deviation representatives per block."""
+    heads, sequence, dim = x.shape
+    padded = _ceil_div(sequence, block) * block
+    if padded != sequence:
+        x = F.pad(x, (0, 0, 0, padded - sequence))
+    grouped = x.view(heads, padded // block, block, dim)
+    valid = (
+        torch.arange(padded, device=x.device) < sequence
+    ).view(1, padded // block, block)
+    valid_float = valid.unsqueeze(-1).to(x.dtype)
+    means = (grouped * valid_float).sum(2) / valid_float.sum(2).clamp_min(1).to(x.dtype)
+    deviation = (grouped.float() - means.float().unsqueeze(2)).square().sum(-1)
+    deviation = deviation.masked_fill(~valid, float("-inf"))
+    representative_count = min(3, block)
+    top_indices = deviation.topk(representative_count, dim=2, largest=True).indices
+    gather_indices = top_indices.unsqueeze(-1).expand(-1, -1, -1, dim)
+    representatives = torch.gather(grouped, 2, gather_indices)
+    selected_valid = torch.gather(
+        valid.expand(heads, -1, -1), 2, top_indices
+    ).unsqueeze(-1)
+    representatives = torch.where(
+        selected_valid, representatives, means.unsqueeze(2).expand_as(representatives)
+    )
+    return torch.cat((means.unsqueeze(2), representatives), dim=2)
+
+
+def compute_peak_aware_micro_tile_scores(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+    q_chunk_size: int = 128,
+) -> torch.Tensor:
+    """Sampled-LSE Q16/K16 probability mass from the method specification.
+
+    Each block contributes its mean and the three tokens furthest from that
+    mean.  The 16 representative pair logits are reduced with log-mean-exp,
+    and the result is softmaxed over K16 blocks.  Query blocks are processed
+    in chunks so the temporary ``[heads, q_chunk, k16, 4, 4]`` tensor is not
+    materialized for the whole sequence at once.
+    """
+    if q.ndim != 3 or k.ndim != 3 or q.shape != k.shape:
+        raise ValueError("q and k must match [heads, sequence, head_dim]")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    if q_chunk_size < 1:
+        raise ValueError("q_chunk_size must be positive")
+    q_representatives = _block_representatives(q)
+    k_representatives = _block_representatives(k)
+    heads, q_blocks, representative_count, dim = q_representatives.shape
+    k_blocks = k_representatives.shape[1]
+    scale = dim ** -0.5
+    log_representative_count = math.log(representative_count * representative_count)
+    scores = []
+    k_representatives = k_representatives.float()
+    for q_start in range(0, q_blocks, q_chunk_size):
+        q_chunk = q_representatives[:, q_start:q_start + q_chunk_size].float()
+        logits = torch.einsum(
+            "hqad,hkbd->hqkab", q_chunk, k_representatives
+        ) * scale
+        logits = logits.reshape(
+            heads, q_chunk.shape[1], k_blocks, representative_count * representative_count
+        )
+        block_scores = torch.logsumexp(logits, dim=-1) - log_representative_count
+        scores.append(torch.softmax(block_scores / temperature, dim=-1))
+    return torch.cat(scores, dim=1)
 
 
 def aggregate_macro_scores(micro_scores: torch.Tensor) -> torch.Tensor:
@@ -541,21 +757,81 @@ def _select_hyvideo_core_tiles(
     return core
 
 
+def _force_dense_heads(core_mask: torch.Tensor, dense_heads) -> None:
+    """Make selected heads attend every valid macro K block.
+
+    This is deliberately applied only to the legacy ``topp_topk`` route by
+    the caller.  Keeping the override at macro-mask level preserves the
+    existing FlashInfer execution path while making the selected heads
+    functionally dense (all Q128 x K96 tiles are present and no Residual
+    complement remains).
+    """
+    if dense_heads is None:
+        core_mask[...] = True
+        return
+    if not dense_heads:
+        return
+    heads = core_mask.shape[0]
+    indices = tuple(sorted(set(int(head) for head in dense_heads)))
+    if any(head < 0 or head >= heads for head in indices):
+        raise ValueError(
+            f"dense head indices {indices} are outside the available range [0, {heads})"
+        )
+    core_mask[list(indices)] = True
+
+
 def select_64_tiles(q, k, *, top_p):
     return select_64_tiles_from_scores(compute_64_tile_scores(q, k), top_p=top_p)
 
 
-def _select_residual_to_total_mass(micro_scores, core_mask, *, total_top_p):
+def _select_residual_to_total_mass(
+    micro_scores,
+    core_mask,
+    *,
+    total_top_p,
+    head_mask: Optional[torch.Tensor] = None,
+    min_top_k: int = 0,
+    max_top_k: Optional[int] = None,
+    score_overrides: Optional[Dict[int, torch.Tensor]] = None,
+):
     """Select rejected microtiles until Core+Residual reaches total Top-p.
 
     ``micro_scores`` is already normalized over all K16 tiles for each
     (head,Q16).  The complement is deliberately *not* renormalized: Core mass
     is subtracted from the requested total mass, and raw rejected mass fills
-    only the remainder.
+    only the remainder.  ``head_mask`` and the optional bounds let the
+    ``topp_topk`` route spend this extra check only on configured risk heads.
     """
     if not 0.0 <= total_top_p <= 1.0:
         raise ValueError("total_top_p must be in [0, 1]")
+    if min_top_k < 0 or (max_top_k is not None and max_top_k < 0):
+        raise ValueError("residual Top-k bounds must be non-negative")
+    if max_top_k is not None and min_top_k > max_top_k:
+        raise ValueError("residual min_top_k cannot exceed max_top_k")
     _, q_micro, k_micro = micro_scores.shape
+    if head_mask is not None:
+        if head_mask.ndim != 1 or head_mask.shape[0] != micro_scores.shape[0]:
+            raise ValueError("head_mask must have shape [heads]")
+        selected_heads = torch.nonzero(head_mask, as_tuple=False).flatten().tolist()
+        residual = torch.zeros_like(micro_scores, dtype=torch.bool)
+        for head in selected_heads:
+            head_scores = micro_scores[head:head + 1]
+            if score_overrides is not None and head in score_overrides:
+                head_scores = score_overrides[head]
+                if head_scores.shape != micro_scores[head:head + 1].shape:
+                    raise ValueError(
+                        f"score override for head {head} has shape "
+                        f"{tuple(head_scores.shape)}, expected "
+                        f"{tuple(micro_scores[head:head + 1].shape)}"
+                    )
+            residual[head:head + 1] = _select_residual_to_total_mass(
+                head_scores,
+                core_mask[head:head + 1],
+                total_top_p=total_top_p,
+                min_top_k=min_top_k,
+                max_top_k=max_top_k,
+            )
+        return residual
     q_parent = torch.arange(q_micro, device=micro_scores.device) // Q_MICROS_PER_MACRO
     k_parent = torch.arange(k_micro, device=micro_scores.device) // K_MICROS_PER_MACRO
     covered_by_core = core_mask[:, q_parent[:, None], k_parent[None, :]]
@@ -563,11 +839,20 @@ def _select_residual_to_total_mass(micro_scores, core_mask, *, total_top_p):
     required_mass = (total_top_p - core_mass).clamp_min(0.0)
     rejected_mass = micro_scores.masked_fill(covered_by_core, 0.0)
     values, indices = torch.sort(rejected_mass, dim=-1, descending=True, stable=True)
-    keep = (
+    keep_by_mass = (
         ((torch.cumsum(values, -1) - values) < required_mass[..., None])
         & (required_mass[..., None] > 0)
         & (values > 0)
     )
+    if min_top_k or max_top_k is not None:
+        selected_count = keep_by_mass.sum(-1)
+        target_count = selected_count.clamp_min(min_top_k)
+        if max_top_k is not None:
+            target_count = target_count.clamp_max(max_top_k)
+        rank = torch.arange(k_micro, device=micro_scores.device)
+        keep = (rank < target_count[..., None]) & (values > 0)
+    else:
+        keep = keep_by_mass
     return torch.zeros_like(covered_by_core).scatter_(-1, indices, keep)
 
 
@@ -1113,6 +1398,177 @@ if triton is not None:
         # allocating/copying a full [H,S,D] output tensor.
         tl.store(core_out_ptr + offsets, merged, mask=mask)
 
+    @triton.jit
+    def _merge_lse_center_rows_kernel(
+        core_out_ptr, core_lse_ptr, residual_out_ptr, residual_lse_ptr,
+        active_rows_ptr, sequence, q_micro_blocks,
+        stride_oh, stride_os, stride_ro,
+        head_dim: tl.constexpr, block_d: tl.constexpr,
+        micro_size: tl.constexpr, center_offset: tl.constexpr,
+    ):
+        """Merge RoDe output for one center token per selected Q16 row."""
+        pid = tl.program_id(0)
+        csr_row = tl.load(active_rows_ptr + pid)
+        head = csr_row // q_micro_blocks
+        qb = csr_row % q_micro_blocks
+        q_pos = qb * micro_size + center_offset
+        valid = q_pos < sequence
+        rows = tl.arange(0, block_d)
+        dims = rows < head_dim
+        core_lse = tl.load(
+            core_lse_ptr + head * sequence + q_pos,
+            mask=valid, other=float("-inf"),
+        )
+        residual_lse = tl.load(residual_lse_ptr + pid, mask=valid, other=float("-inf"))
+        m = tl.maximum(core_lse, residual_lse)
+        wc = tl.where(core_lse != float("-inf"), tl.exp(core_lse - m), 0.0)
+        wr = tl.where(residual_lse != float("-inf"), tl.exp(residual_lse - m), 0.0)
+        z = tl.maximum(wc + wr, 1.0e-20)
+        offsets = head * stride_oh + q_pos * stride_os + rows
+        core = tl.load(core_out_ptr + offsets, mask=valid & dims, other=0.0).to(tl.float32)
+        residual = tl.load(
+            residual_out_ptr + pid * stride_ro + rows,
+            mask=valid & dims, other=0.0,
+        ).to(tl.float32)
+        merged = (wc * core + wr * residual) / z
+        tl.store(core_out_ptr + offsets, merged, mask=valid & dims)
+
+
+def _build_rode_center_csr(route, *, heads: int, sequence: int):
+    """Expand selected Q16/K16 tiles into one center-token CSR edge each."""
+    cache = getattr(route, "_rode_center_csr", None)
+    if cache is not None:
+        return cache
+
+    device = route.residual_indices.device
+    q_micro_blocks = _ceil_div(sequence, MICRO)
+    micro_rows = torch.arange(
+        heads * q_micro_blocks, device=device, dtype=torch.long
+    )
+    counts = (route.residual_indptr[1:] - route.residual_indptr[:-1]).to(torch.long)
+    edge_micro_rows = torch.repeat_interleave(micro_rows, counts)
+    key_micro = route.residual_indices.to(torch.long)
+    center_q = (edge_micro_rows % q_micro_blocks) * MICRO + (MICRO // 2)
+    center_k = key_micro * MICRO + (MICRO // 2)
+    valid = (center_q < sequence) & (center_k < sequence)
+    edge_micro_rows = edge_micro_rows[valid]
+    center_k = center_k[valid]
+    heads_for_edge = edge_micro_rows // q_micro_blocks
+    center_rows = heads_for_edge * sequence + center_q[valid]
+    center_cols = heads_for_edge * sequence + center_k
+
+    row_count = torch.bincount(
+        center_rows, minlength=heads * sequence
+    ).to(torch.int32)
+    row_ptr = torch.empty(heads * sequence + 1, dtype=torch.int32, device=device)
+    row_ptr[0] = 0
+    torch.cumsum(row_count, dim=0, dtype=torch.int32, out=row_ptr[1:])
+    active = row_count > 0
+    active_token_rows = torch.nonzero(active, as_tuple=False).flatten().to(torch.int32)
+    active_q16_rows = (
+        (active_token_rows.to(torch.long) // sequence) * q_micro_blocks
+        + ((active_token_rows.to(torch.long) % sequence) // MICRO)
+    ).to(torch.int32)
+
+    # edge_micro_rows is generated in CSR row order, so center_cols already
+    # matches the row_ptr order expected by RoDe.
+    cache = {
+        "row_ptr_cpu": row_ptr.cpu().contiguous(),
+        "columns_cpu": center_cols.to(torch.int32).cpu().contiguous(),
+        "row_ptr": row_ptr,
+        "edge_rows": center_rows.to(torch.int32),
+        "active_q16_rows": active_q16_rows,
+        "active_token_rows": active_token_rows,
+        "nnz": int(center_cols.numel()),
+    }
+    route._rode_center_csr = cache
+    return cache
+
+
+def _run_residual_rode_center(q, k, v, route, recorder=None, step=-1, layer=-1):
+    """Run downloaded RoDe on center-token CSR edges from residual tiles."""
+    if load_rode_extension is None:
+        raise RuntimeError("RoDe backend loader is unavailable")
+    heads, sequence, dim = q.shape
+    cache = _build_rode_center_csr(route, heads=heads, sequence=sequence)
+    if cache["nnz"] == 0:
+        return None
+
+    plan = getattr(route, "_rode_center_plan", None)
+    if plan is None:
+        plan_start = _timing_start(recorder, q.device)
+        rode = load_rode_extension()
+        plan = rode.RoDeCenterPlan(
+            cache["row_ptr_cpu"], cache["columns_cpu"], heads * sequence, 32, 512
+        )
+        route._rode_center_plan = plan
+        _timing_stop(
+            recorder, plan_start, "flashinfer_residual_rode_plan",
+            step, layer, q.device,
+        )
+
+    fp32_start = _timing_start(recorder, q.device)
+    qf = q.float().reshape(heads * sequence, dim).contiguous()
+    kf = k.float().reshape(heads * sequence, dim).contiguous()
+    vf = v.float().reshape(heads * sequence, dim).contiguous()
+    _timing_stop(
+        recorder, fp32_start, "flashinfer_residual_rode_fp32",
+        step, layer, q.device,
+    )
+
+    sddmm_start = _timing_start(recorder, q.device)
+    scores = plan.sddmm(qf, kf) * (dim ** -0.5)
+    _timing_stop(
+        recorder, sddmm_start, "flashinfer_residual_rode_sddmm",
+        step, layer, q.device,
+    )
+
+    softmax_start = _timing_start(recorder, q.device)
+    edge_rows = cache["edge_rows"].to(torch.long)
+    max_rows = torch.full(
+        (heads * sequence,), float("-inf"), device=q.device, dtype=torch.float32
+    )
+    max_rows.scatter_reduce_(0, edge_rows, scores, reduce="amax", include_self=True)
+    exp_scores = torch.exp(scores - max_rows[edge_rows])
+    norm = torch.zeros_like(max_rows)
+    norm.scatter_add_(0, edge_rows, exp_scores)
+    probs = exp_scores / norm[edge_rows].clamp_min(torch.finfo(torch.float32).tiny)
+    lse = max_rows + torch.log(norm.clamp_min(torch.finfo(torch.float32).tiny))
+    _timing_stop(
+        recorder, softmax_start, "flashinfer_residual_rode_softmax",
+        step, layer, q.device,
+    )
+
+    spmm_start = _timing_start(recorder, q.device)
+    output_full = plan.spmm(probs, vf)
+    center_output = output_full[cache["active_token_rows"].to(torch.long)].contiguous()
+    center_lse = lse[cache["active_token_rows"].to(torch.long)].contiguous()
+    _timing_stop(
+        recorder, spmm_start, "flashinfer_residual_rode_spmm",
+        step, layer, q.device,
+    )
+    return center_output, center_lse, cache["active_q16_rows"]
+
+
+def _merge_lse_center_rows(
+    core_output, core_lse, residual_output, residual_lse, active_q16_rows, sequence,
+):
+    if triton is None:
+        raise RuntimeError("RoDe center merge requires Triton")
+    if active_q16_rows.numel() == 0:
+        return core_output
+    _merge_lse_center_rows_kernel[(active_q16_rows.numel(),)](
+        core_output, core_lse, residual_output, residual_lse,
+        active_q16_rows, sequence, _ceil_div(sequence, MICRO),
+        core_output.stride(0), core_output.stride(1), residual_output.stride(0),
+        head_dim=core_output.shape[-1],
+        block_d=triton.next_power_of_2(core_output.shape[-1]),
+        micro_size=MICRO,
+        center_offset=MICRO // 2,
+        num_warps=4,
+    )
+    return core_output
+
 
 def _run_residual_micro(q, k, v, route, recorder=None, step=-1, layer=-1):
     heads, sequence, dim = q.shape
@@ -1211,8 +1667,33 @@ class FlashInfer64Attention:
 
     def __init__(self):
         self.route: Optional[FlashInfer64Route] = None
+        # Optional lightweight cache used only by the RoDe center experiment.
+        # It keeps the support/CSR needed to reuse a RoDe plan, but drops the
+        # micro-residual buckets and other transient route data.
+        self._rode_route_cache: Optional[FlashInfer64Route] = None
         self.last_stats = None
         self._direct_core_plan: Optional[_DirectMacroCSRPlan] = None
+        self._route_dense_heads_key = ()
+        self._route_high_omission_heads_key = ()
+        self._route_residual_scorer_key = ()
+        self._parallel_residual_stream: Optional[torch.cuda.Stream] = None
+        self._parallel_residual_device = None
+
+    @staticmethod
+    def _compact_rode_route(route: FlashInfer64Route) -> FlashInfer64Route:
+        """Drop data needed only by the ordinary micro residual backend."""
+        route.residual_mask = None
+        route.residual_buckets = ()
+        return route
+
+    def _get_parallel_residual_stream(self, device: torch.device) -> torch.cuda.Stream:
+        if (
+            self._parallel_residual_stream is None
+            or self._parallel_residual_device != device
+        ):
+            self._parallel_residual_stream = torch.cuda.Stream(device=device)
+            self._parallel_residual_device = device
+        return self._parallel_residual_stream
 
     def _plan_core(self, q, core_mask, *, route_identity=None, direct_macro_csr=True):
         global _shared_core_wrapper, _shared_core_workspace, _shared_core_signature
@@ -1301,6 +1782,11 @@ class FlashInfer64Attention:
         fine_top_k: Optional[int] = None,
         token_top_k: Optional[int], token_top_ratio: float, token_top_p: float = 0.9,
         promotion_threshold: int = 24,
+        dense_layer: int = -1,
+        dense_heads=(),
+        high_omission_heads_file: Optional[str] = None,
+        residual_scorer: str = "proxy",
+        residual_temperature: float = 1.0,
         reuse_route: bool = False,
         core_only: bool = False,
         direct_macro_csr: bool = True,
@@ -1309,6 +1795,58 @@ class FlashInfer64Attention:
         step_idx: int = -1, layer_idx: int = -1,
     ):
         del token_top_k, token_top_ratio  # retained only for old launch scripts
+        if residual_scorer not in ("proxy", "sampled_lse"):
+            raise ValueError(
+                "residual_scorer must be 'proxy' or 'sampled_lse'"
+            )
+        if residual_temperature <= 0:
+            raise ValueError("residual_temperature must be positive")
+        residual_backend = os.environ.get(
+            "FLASHINFER64_RESIDUAL_BACKEND", "micro"
+        ).lower()
+        if residual_backend not in ("micro", "rode_center"):
+            raise ValueError(
+                "FLASHINFER64_RESIDUAL_BACKEND must be 'micro' or 'rode_center'"
+            )
+        if residual_backend == "rode_center" and route_mode != "topk_topp":
+            raise ValueError(
+                "rode_center is isolated to the already2.md topk_topp route; "
+                f"got route_mode={route_mode!r}"
+            )
+        rode_cache_value = os.environ.get(
+            "FLASHINFER64_RODE_CACHE", "False"
+        ).strip().lower()
+        if rode_cache_value not in ("0", "1", "false", "true", "no", "yes", "off", "on"):
+            raise ValueError(
+                "FLASHINFER64_RODE_CACHE must be a boolean string"
+            )
+        rode_cache_enabled = (
+            residual_backend == "rode_center"
+            and not reuse_route
+            and rode_cache_value in ("1", "true", "yes", "on")
+        )
+        if not rode_cache_enabled:
+            self._rode_route_cache = None
+        replay_file = os.environ.get("FLASHINFER64_REPLAY_MASK_FILE", "")
+        if replay_file and route_mode != "topk_topp":
+            raise ValueError("FLASHINFER64_REPLAY_MASK_FILE requires route_mode=topk_topp")
+        high_omission_heads_key = ()
+        high_omission_heads_by_layer = {}
+        if route_mode in ("topp_topk", "topk_topp"):
+            high_omission_heads_by_layer, high_omission_heads_key = (
+                _load_high_omission_heads(high_omission_heads_file)
+            )
+        high_omission_heads = high_omission_heads_by_layer.get(layer_idx, ())
+        residual_scorer_key = (
+            residual_scorer, float(residual_temperature)
+        ) if route_mode in ("topp_topk", "topk_topp") else ()
+        dense_heads_key = ()
+        if route_mode == "topp_topk" and dense_layer == layer_idx:
+            dense_heads_key = (
+                None
+                if dense_heads is None
+                else tuple(sorted(set(int(head) for head in dense_heads)))
+            )
         start = _timing_start(timing_recorder, q.device)
         qh, kh, vh, inverse = _permute_qkv(q, k, v, video_perm, video_len)
         _timing_stop(timing_recorder, start, "flashinfer_qkv_permute", step_idx, layer_idx, q.device)
@@ -1335,8 +1873,35 @@ class FlashInfer64Attention:
             and (fine_top_k is None or self.route.fine_top_k == fine_top_k)
             and self.route.fine_top_ratio == fine_top_ratio
             and self.route.core_only == core_only
+            and self._route_dense_heads_key == dense_heads_key
+            and self._route_high_omission_heads_key == high_omission_heads_key
+            and self._route_residual_scorer_key == residual_scorer_key
             and self.route.core_mask.device == q.device
         )
+        if rode_cache_enabled and not refresh_route:
+            cached_route = self._rode_route_cache
+            cached_route_valid = (
+                cached_route is not None
+                and cached_route.sequence == sequence
+                and cached_route.video_len == (-1 if video_len is None else video_len)
+                and cached_route.route_mode == route_mode
+                and cached_route.top_p == tile_top_p
+                and cached_route.tile_top_ratio == tile_top_ratio
+                and cached_route.token_top_p == token_top_p
+                and cached_route.promotion_threshold == promotion_threshold
+                and (fine_top_k is None or cached_route.fine_top_k == fine_top_k)
+                and cached_route.fine_top_ratio == fine_top_ratio
+                and cached_route.core_only == core_only
+                and self._route_dense_heads_key == dense_heads_key
+                and self._route_high_omission_heads_key == high_omission_heads_key
+                and self._route_residual_scorer_key == residual_scorer_key
+                and cached_route.core_mask.device == q.device
+            )
+            if cached_route_valid:
+                # Keep the same route object identity so the direct Core plan
+                # and the RoDe plan both hit their per-layer caches.
+                self.route = cached_route
+                route_valid = True
         if refresh_route or not route_valid:
             fine_start = _timing_start(timing_recorder, q.device)
             micro_scores = compute_micro_tile_scores(qh, kh)
@@ -1446,6 +2011,8 @@ class FlashInfer64Attention:
                     macro_scores, route_mode=route_mode, tile_top_p=tile_top_p,
                     tile_top_ratio=tile_top_ratio, sequence=sequence, video_len=video_len,
                 )
+                if dense_heads_key != ():
+                    _force_dense_heads(core, dense_heads_key)
                 _timing_stop(timing_recorder, core_select_start, "flashinfer_core_select", step_idx, layer_idx, q.device)
 
                 if core_only:
@@ -1461,9 +2028,56 @@ class FlashInfer64Attention:
                     residual_count_stats = (0.0, 0.0, 0.0, 0.0, 0.0)
                 else:
                     residual_select_start = _timing_start(timing_recorder, q.device)
-                    residual = _select_residual_to_total_mass(
-                        micro_scores, core, total_top_p=token_top_p,
-                    )
+                    if replay_file:
+                        residual = _replay_residual_mask(
+                            micro_scores,
+                            core,
+                            replay_file=replay_file,
+                            step_idx=step_idx,
+                            layer_idx=layer_idx,
+                        )
+                    else:
+                        risk_head_mask = torch.zeros(
+                            micro_scores.shape[0], dtype=torch.bool, device=q.device
+                        )
+                        valid_risk_heads = tuple(
+                            head for head in high_omission_heads
+                            if head < micro_scores.shape[0]
+                        )
+                        if valid_risk_heads:
+                            risk_head_mask[list(valid_risk_heads)] = True
+                        score_overrides = None
+                        if residual_scorer == "sampled_lse" and valid_risk_heads:
+                            peak_score_start = _timing_start(timing_recorder, q.device)
+                            peak_scores = compute_peak_aware_micro_tile_scores(
+                                qh[list(valid_risk_heads)],
+                                kh[list(valid_risk_heads)],
+                                temperature=residual_temperature,
+                                q_chunk_size=int(os.environ.get(
+                                    "FLASHINFER64_SAMPLED_LSE_Q_CHUNK", "128"
+                                )),
+                            )
+                            score_overrides = {
+                                head: peak_scores[index:index + 1]
+                                for index, head in enumerate(valid_risk_heads)
+                            }
+                            _timing_stop(
+                                timing_recorder,
+                                peak_score_start,
+                                "flashinfer_peak_score",
+                                step_idx,
+                                layer_idx,
+                                q.device,
+                            )
+                        residual = _select_residual_to_total_mass(
+                            micro_scores,
+                            core,
+                            total_top_p=token_top_p,
+                            head_mask=risk_head_mask,
+                            min_top_k=20 if high_omission_heads else 0,
+                            max_top_k=32 if high_omission_heads else None,
+                            score_overrides=score_overrides,
+                        )
                     _timing_stop(timing_recorder, residual_select_start, "flashinfer_residual_select", step_idx, layer_idx, q.device)
 
                     promotion_start = _timing_start(timing_recorder, q.device)
@@ -1519,6 +2133,9 @@ class FlashInfer64Attention:
                 fine_top_ratio, promotion_threshold, occupancy, occupancy_histogram,
                 head_occupancy_stats, head_tau_stats,
             )
+            self._route_dense_heads_key = dense_heads_key
+            self._route_high_omission_heads_key = high_omission_heads_key
+            self._route_residual_scorer_key = residual_scorer_key
             del micro_scores, macro_scores, residual
 
         route = self.route
@@ -1557,23 +2174,87 @@ class FlashInfer64Attention:
             )
             _timing_stop(timing_recorder, plan_start, "flashinfer_plan", step_idx, layer_idx, q.device)
 
+        has_residual = route.residual_indices.numel() != 0
+        parallel_requested = os.environ.get(
+            "FLASHINFER64_PARALLEL_CORE_RESIDUAL", "False"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        parallel_core_residual = bool(
+            parallel_requested and qh.is_cuda and has_residual and not core_only
+        )
+        current_stream = None
+        residual_stream = None
+        if parallel_core_residual:
+            current_stream = torch.cuda.current_stream(qh.device)
+            residual_stream = self._get_parallel_residual_stream(qh.device)
+            # Capture all preprocessing and route/plan work already queued on
+            # the current stream.  Core is launched below on the current
+            # stream, while Residual starts after this snapshot and can run
+            # concurrently with Core.
+            residual_stream.wait_stream(current_stream)
+
         core_output, core_lse = self._run_core(
             qh, kh, vh, route, wrapper,
             timing_recorder, step_idx, layer_idx,
         )
+
+        def run_residual_backend():
+            if residual_backend == "rode_center":
+                residual_start = _timing_start(timing_recorder, q.device)
+                result = _run_residual_rode_center(
+                    qh, kh, vh, route, timing_recorder, step_idx, layer_idx,
+                )
+                _timing_stop(
+                    timing_recorder, residual_start, "flashinfer_residual_rode_run",
+                    step_idx, layer_idx, q.device,
+                )
+                return result
+
+            residual_start = _timing_start(timing_recorder, q.device)
+            result = _run_residual_micro(
+                qh, kh, vh, route, timing_recorder, step_idx, layer_idx,
+            )
+            _timing_stop(
+                timing_recorder, residual_start, "flashinfer_residual_micro_run",
+                step_idx, layer_idx, q.device,
+            )
+            return result
+
         if route.residual_indices.numel() == 0:
             merged = core_output
         else:
-            residual_start = _timing_start(timing_recorder, q.device)
-            residual_output, residual_lse = _run_residual_micro(
-                qh, kh, vh, route, timing_recorder, step_idx, layer_idx,
-            )
-            _timing_stop(timing_recorder, residual_start, "flashinfer_residual_micro_run", step_idx, layer_idx, q.device)
-            merge_start = _timing_start(timing_recorder, q.device)
-            merged = _merge_lse_active_rows(
-                core_output, core_lse, residual_output, residual_lse, route,
-            )
-            _timing_stop(timing_recorder, merge_start, "flashinfer_lse_merge", step_idx, layer_idx, q.device)
+            if parallel_core_residual:
+                assert residual_stream is not None and current_stream is not None
+                with torch.cuda.stream(residual_stream):
+                    residual_result = run_residual_backend()
+                # Merge executes on the caller's stream and must observe all
+                # Residual writes before reading its compact output/LSE.
+                current_stream.wait_stream(residual_stream)
+            else:
+                residual_result = run_residual_backend()
+
+            if residual_result is None:
+                merged = core_output
+            elif residual_backend == "rode_center":
+                residual_output, residual_lse, active_q16_rows = residual_result
+                merge_start = _timing_start(timing_recorder, q.device)
+                merged = _merge_lse_center_rows(
+                    core_output, core_lse, residual_output, residual_lse,
+                    active_q16_rows, sequence,
+                )
+                _timing_stop(
+                    timing_recorder, merge_start, "flashinfer_lse_merge",
+                    step_idx, layer_idx, q.device,
+                )
+            else:
+                residual_output, residual_lse = residual_result
+                merge_start = _timing_start(timing_recorder, q.device)
+                merged = _merge_lse_active_rows(
+                    core_output, core_lse, residual_output, residual_lse, route,
+                )
+                _timing_stop(
+                    timing_recorder, merge_start, "flashinfer_lse_merge",
+                    step_idx, layer_idx, q.device,
+                )
 
         density_start = _timing_start(timing_recorder, q.device)
         if record_density:
@@ -1604,12 +2285,17 @@ class FlashInfer64Attention:
             timing_recorder, density_start, "flashinfer_density_accounting",
             step_idx, layer_idx, q.device,
         )
+        if rode_cache_enabled:
+            # Preserve only the support and the already-built RoDe/center
+            # plans.  The ordinary micro backend's buckets are not needed by
+            # this isolated path and can be released before the next step.
+            self._rode_route_cache = self._compact_rode_route(route)
         output_start = _timing_start(timing_recorder, q.device)
         output = restore(merged)
         _timing_stop(timing_recorder, output_start, "flashinfer_output_unpermute", step_idx, layer_idx, q.device)
         if not reuse_route:
             self.route = None
-            if self._direct_core_plan is not None:
+            if self._direct_core_plan is not None and not rode_cache_enabled:
                 # Do not keep the full route alive solely through the cache
                 # identity when the caller selected bounded-memory mode.
                 self._direct_core_plan.route_identity = None
@@ -1618,7 +2304,8 @@ class FlashInfer64Attention:
 
 __all__ = [
     "FlashInfer64Attention", "FlashInfer64Route", "Q_MACRO", "K_MACRO", "MICRO",
-    "compute_micro_tile_scores", "aggregate_macro_scores", "compute_64_tile_scores",
+    "compute_micro_tile_scores", "compute_peak_aware_micro_tile_scores",
+    "aggregate_macro_scores", "compute_64_tile_scores",
     "select_64_tiles", "select_64_tiles_from_scores", "select_64_tiles_topk_from_scores",
     "select_fine_topk_from_scores",
 ]

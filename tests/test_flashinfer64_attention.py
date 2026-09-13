@@ -1,9 +1,13 @@
+import json
+import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
 
+from dfsattn.attention_hyvideo import _compute_flashinfer64_tile_schedule
 from dfsattn.flashinfer64_attention import (
     FlashInfer64Attention,
     K_MACRO,
@@ -11,11 +15,16 @@ from dfsattn.flashinfer64_attention import (
     Q_MACRO,
     _build_residual_csr,
     _build_residual_csr_from_fine_indices,
+    _build_rode_center_csr,
     _ensure_flashinfer_vector_workspace,
     _compute_head_occupancy_tau_stats,
+    compute_peak_aware_micro_tile_scores,
     _fine_topk_occupancy_route,
+    _force_dense_heads,
+    _load_high_omission_heads,
     _merge_lse_active_rows,
     _promote_residual_microtiles,
+    _replay_residual_mask,
     _select_residual_to_total_mass,
     _select_hyvideo_core_tiles,
     compute_64_tile_scores,
@@ -27,6 +36,267 @@ from analyze_macro_topk_error import fixed_macro_topk, macro_structure
 
 
 class FlashInfer64AttentionTest(unittest.TestCase):
+    def test_dynamic_macro_ratio_matches_native_dfsattn_schedule(self) -> None:
+        expected = {
+            11: (False, 0.30),
+            12: (True, 0.30),
+            23: (False, 0.30),
+            24: (True, 0.20),
+            35: (False, 0.20),
+            36: (True, 0.10),
+            47: (False, 0.10),
+            48: (False, 0.10),
+            49: (False, 0.10),
+        }
+        for step_idx, expected_value in expected.items():
+            actual = _compute_flashinfer64_tile_schedule(
+                step_idx=step_idx,
+                skip_steps=12,
+                cache_interval=12,
+                tile_top_ratio=0.30,
+                sparsity_dcrt=0.10,
+                dynamic_tile_ratio=True,
+            )
+            self.assertEqual(actual[0], expected_value[0])
+            self.assertAlmostEqual(actual[1], expected_value[1])
+
+    def test_fixed_macro_ratio_keeps_periodic_route_refresh(self) -> None:
+        for step_idx, refresh in ((12, True), (24, True), (36, True), (48, True)):
+            actual_refresh, ratio = _compute_flashinfer64_tile_schedule(
+                step_idx=step_idx,
+                skip_steps=12,
+                cache_interval=12,
+                tile_top_ratio=0.195,
+                sparsity_dcrt=0.10,
+                dynamic_tile_ratio=False,
+            )
+            self.assertEqual(actual_refresh, refresh)
+            self.assertAlmostEqual(ratio, 0.195)
+
+    def test_sampled_lse_micro_scores_are_normalized_and_chunkable(self) -> None:
+        torch.manual_seed(36)
+        q = torch.randn(2, 33, 8)
+        k = torch.randn_like(q)
+        scores = compute_peak_aware_micro_tile_scores(
+            q, k, temperature=1.0, q_chunk_size=2,
+        )
+        self.assertEqual(tuple(scores.shape), (2, 3, 3))
+        self.assertTrue(bool(torch.isfinite(scores).all()))
+        torch.testing.assert_close(
+            scores.sum(-1), torch.ones_like(scores.sum(-1)), atol=1e-6, rtol=1e-6,
+        )
+
+    def test_topp_topk_residual_check_is_limited_to_configured_heads(self) -> None:
+        torch.manual_seed(35)
+        sequence = 193
+        q = torch.randn(1, 2, sequence, 16)
+        k, v = torch.randn_like(q), torch.randn_like(q)
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as handle:
+            handle.write("# test risk prior\nLayer2 / Head1\n")
+            path = handle.name
+        try:
+            parsed, _ = _load_high_omission_heads(path)
+            self.assertEqual(parsed, {2: (1,)})
+            backend = FlashInfer64Attention()
+            backend(
+                q, k, v,
+                video_perm=None,
+                video_len=None,
+                route_mode="topp_topk",
+                tile_top_p=0.1,
+                token_top_k=None,
+                token_top_ratio=0.1,
+                token_top_p=0.0,
+                promotion_threshold=48,
+                high_omission_heads_file=path,
+                layer_idx=2,
+                refresh_route=True,
+                reuse_route=True,
+            )
+            residual = backend.route.residual_mask
+            self.assertEqual(int(residual[0].sum()), 0)
+            self.assertGreater(int(residual[1].sum()), 0)
+        finally:
+            os.unlink(path)
+
+    def test_topk_topp_sampled_lse_scorer_runs_only_for_risk_head(self) -> None:
+        torch.manual_seed(37)
+        q = torch.randn(1, 2, 193, 16)
+        k, v = torch.randn_like(q), torch.randn_like(q)
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as handle:
+            handle.write("Layer2 / Head1\n")
+            path = handle.name
+        try:
+            backend = FlashInfer64Attention()
+            backend(
+                q, k, v,
+                video_perm=None,
+                video_len=None,
+                route_mode="topk_topp",
+                tile_top_p=0.1,
+                tile_top_ratio=0.16,
+                token_top_k=None,
+                token_top_ratio=0.1,
+                token_top_p=0.0,
+                promotion_threshold=48,
+                high_omission_heads_file=path,
+                residual_scorer="sampled_lse",
+                layer_idx=2,
+                refresh_route=True,
+                reuse_route=True,
+            )
+            self.assertEqual(int(backend.route.residual_mask[0].sum()), 0)
+            self.assertGreater(int(backend.route.residual_mask[1].sum()), 0)
+        finally:
+            os.unlink(path)
+
+    def test_replay_mask_is_core_disjoint(self) -> None:
+        micro = torch.zeros((1, 16, 18))
+        core = torch.zeros((1, 2, 3), dtype=torch.bool)
+        core[0, 0, 1] = True
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump({"rows": {"12:12": [[0, 1, 7], [0, 9, 17]]}}, handle)
+            path = handle.name
+        try:
+            replay = _replay_residual_mask(
+                micro, core, replay_file=path, step_idx=12, layer_idx=12,
+            )
+            self.assertFalse(bool(replay[0, 1, 7]))  # already covered by Core
+            self.assertTrue(bool(replay[0, 9, 17]))
+            self.assertEqual(int(replay.sum()), 1)
+        finally:
+            os.unlink(path)
+
+    def test_replay_mask_uses_latest_prior_anchor(self) -> None:
+        micro = torch.zeros((1, 16, 18))
+        core = torch.zeros((1, 2, 3), dtype=torch.bool)
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump({
+                "rows": {
+                    "12:12": [[0, 1, 7]],
+                    "24:12": [[0, 2, 8]],
+                    "36:12": [[0, 3, 9]],
+                }
+            }, handle)
+            path = handle.name
+        try:
+            before_first = _replay_residual_mask(
+                micro, core, replay_file=path, step_idx=11, layer_idx=12,
+            )
+            from_12 = _replay_residual_mask(
+                micro, core, replay_file=path, step_idx=23, layer_idx=12,
+            )
+            from_24 = _replay_residual_mask(
+                micro, core, replay_file=path, step_idx=35, layer_idx=12,
+            )
+            from_36 = _replay_residual_mask(
+                micro, core, replay_file=path, step_idx=49, layer_idx=12,
+            )
+            self.assertEqual(int(before_first.sum()), 0)
+            self.assertTrue(bool(from_12[0, 1, 7]))
+            self.assertTrue(bool(from_24[0, 2, 8]))
+            self.assertTrue(bool(from_36[0, 3, 9]))
+        finally:
+            os.unlink(path)
+
+    def test_replay_mask_full_q16_row_sentinel(self) -> None:
+        micro = torch.zeros((1, 2, 12))
+        core = torch.zeros((1, 1, 2), dtype=torch.bool)
+        core[0, 0, 0] = True
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump({"rows": {"12:12": [[0, 1, -1]]}}, handle)
+            path = handle.name
+        try:
+            replay = _replay_residual_mask(
+                micro, core, replay_file=path, step_idx=12, layer_idx=12,
+            )
+            self.assertEqual(int(replay[0, 1].sum()), 6)
+        finally:
+            os.unlink(path)
+
+    def test_replay_route_is_reused_between_refresh_steps(self) -> None:
+        torch.manual_seed(34)
+        q = torch.randn(1, 1, 193, 16)
+        k, v = torch.randn_like(q), torch.randn_like(q)
+        backend = FlashInfer64Attention()
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump({"rows": {"12:12": [[0, 0, 12]]}}, handle)
+            path = handle.name
+        previous = os.environ.get("FLASHINFER64_REPLAY_MASK_FILE")
+        os.environ["FLASHINFER64_REPLAY_MASK_FILE"] = path
+        common = dict(
+            video_perm=None, video_len=None, route_mode="topk_topp",
+            tile_top_p=0.25, tile_top_ratio=0.5,
+            token_top_k=None, token_top_ratio=0.1, token_top_p=0.9,
+            promotion_threshold=24, reuse_route=True, layer_idx=12,
+        )
+        try:
+            backend(q, k, v, refresh_route=True, step_idx=12, **common)
+            route = backend.route
+            backend(q, k, v, refresh_route=False, step_idx=13, **common)
+            self.assertIs(backend.route, route)
+        finally:
+            if previous is None:
+                os.environ.pop("FLASHINFER64_REPLAY_MASK_FILE", None)
+            else:
+                os.environ["FLASHINFER64_REPLAY_MASK_FILE"] = previous
+            os.unlink(path)
+
+    def test_topp_topk_dense_head_override_forces_full_macro_support(self) -> None:
+        torch.manual_seed(33)
+        sequence = 129
+        q = torch.randn(1, 2, sequence, 16)
+        k, v = torch.randn_like(q), torch.randn_like(q)
+        backend = FlashInfer64Attention()
+        actual = backend(
+            q,
+            k,
+            v,
+            video_perm=None,
+            video_len=None,
+            route_mode="topp_topk",
+            tile_top_p=0.25,
+            tile_top_ratio=0.5,
+            token_top_k=None,
+            token_top_ratio=0.1,
+            token_top_p=0.0,
+            dense_layer=12,
+            dense_heads=(1,),
+            layer_idx=12,
+            reuse_route=True,
+            refresh_route=True,
+            record_density=True,
+        )
+        route = backend.route
+        self.assertTrue(bool(route.core_mask[1].all()))
+        self.assertFalse(bool(route.core_mask[0].all()))
+        expected_dense = F.scaled_dot_product_attention(
+            q[:, 1], k[:, 1], v[:, 1]
+        )
+        torch.testing.assert_close(actual[0, 1], expected_dense[0], atol=1e-5, rtol=1e-5)
+        self.assertEqual(
+            backend.last_stats["core_interactions"],
+            int(route.core_mask.repeat_interleave(Q_MACRO, 1)
+                .repeat_interleave(K_MACRO, 2)[:, :sequence, :sequence].sum()),
+        )
+
+    def test_dense_head_override_is_layer_scoped(self) -> None:
+        core = torch.zeros((2, 1, 2), dtype=torch.bool)
+        _force_dense_heads(core, (1,))
+        self.assertTrue(bool(core[1].all()))
+        self.assertFalse(bool(core[0].any()))
+
+    def test_rode_center_csr_maps_one_edge_per_residual_microtile(self) -> None:
+        route = SimpleNamespace(
+            residual_indices=torch.tensor([1, 3, 0], dtype=torch.int32),
+            residual_indptr=torch.tensor([0, 2, 2, 3, 3], dtype=torch.int32),
+        )
+        packed = _build_rode_center_csr(route, heads=1, sequence=64)
+        self.assertEqual(packed["columns_cpu"].tolist(), [24, 56, 8])
+        self.assertEqual(packed["edge_rows"].tolist(), [8, 8, 40])
+        self.assertEqual(packed["active_q16_rows"].tolist(), [0, 2])
+        self.assertEqual(packed["nnz"], 3)
+
     def test_per_head_occupancy_and_tau_stats_reuse_fixed_support(self) -> None:
         micro_scores = torch.full((1, 8, 6), 1.0 / 6.0)
         fine_indices = torch.zeros((1, 8, 2), dtype=torch.int32)
@@ -497,20 +767,28 @@ class FlashInfer64AttentionTest(unittest.TestCase):
         q = torch.randn(1, 1, 193, 16)
         k, v = torch.randn_like(q), torch.randn_like(q)
         recorder = AttentionTimingRecorder(enabled=True)
-        FlashInfer64Attention()(
-            q, k, v,
-            video_perm=None,
-            video_len=None,
-            route_mode="topk_topp",
-            tile_top_p=0.25,
-            tile_top_ratio=0.5,
-            token_top_k=None,
-            token_top_ratio=0.1,
-            token_top_p=0.8,
-            promotion_threshold=24,
-            refresh_route=True,
-            timing_recorder=recorder,
-        )
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as handle:
+            handle.write("Layer0 / Head0\n")
+            path = handle.name
+        try:
+            FlashInfer64Attention()(
+                q, k, v,
+                video_perm=None,
+                video_len=None,
+                route_mode="topk_topp",
+                tile_top_p=0.25,
+                tile_top_ratio=0.5,
+                token_top_k=None,
+                token_top_ratio=0.1,
+                token_top_p=0.8,
+                promotion_threshold=24,
+                high_omission_heads_file=path,
+                layer_idx=0,
+                refresh_route=True,
+                timing_recorder=recorder,
+            )
+        finally:
+            os.unlink(path)
         phases = {row["phase"] for row in recorder.rows()}
         self.assertTrue({
             "flashinfer_fine_score",

@@ -23,17 +23,29 @@ token_top_k="${TOKEN_TOP_K:-0}"
 residual_candidate_blocks="${RESIDUAL_CANDIDATE_BLOCKS:-4}"
 selector_mode="${SELECTOR_MODE:-topk}"
 fine_top_p="${FINE_TOP_P:-0.9}"
-flashinfer64_top_p="${FLASHINFER64_TOP_P:-0.25}"
+flashinfer64_top_p="${FLASHINFER64_TOP_P:-0.16}"
 flashinfer64_token_top_ratio="${FLASHINFER64_TOKEN_TOP_RATIO:-0.10}"
 flashinfer64_route_mode="${FLASHINFER64_ROUTE_MODE:-fine_topk_occupancy}"
 flashinfer64_tile_top_ratio="${FLASHINFER64_TILE_TOP_RATIO:-0.25}"
+flashinfer64_dynamic_tile_ratio="${FLASHINFER64_DYNAMIC_TILE_RATIO:-False}"
 flashinfer64_fine_top_ratio="${FLASHINFER64_FINE_TOP_RATIO:-0.2}"
 flashinfer64_fine_top_k_override="${FLASHINFER64_FINE_TOP_K:-}"
 flashinfer64_token_top_p="${FLASHINFER64_TOKEN_TOP_P:-0.9}"
 flashinfer64_promotion_threshold="${FLASHINFER64_PROMOTION_THRESHOLD:-24}"
+flashinfer64_dense_layer="${FLASHINFER64_DENSE_LAYER:--1}"
+flashinfer64_dense_heads="${FLASHINFER64_DENSE_HEADS:-}"
+flashinfer64_high_omission_heads_file="${FLASHINFER64_HIGH_OMISSION_HEADS_FILE:-}"
+flashinfer64_residual_scorer="${FLASHINFER64_RESIDUAL_SCORER:-proxy}"
+flashinfer64_residual_temperature="${FLASHINFER64_RESIDUAL_TEMPERATURE:-1.0}"
 flashinfer64_route_cache="${FLASHINFER64_ROUTE_CACHE:-False}"
-flashinfer64_core_only="${FLASHINFER64_CORE_ONLY:-False}"
+flashinfer64_core_only="${FLASHINFER64_CORE_ONLY:-True}"
 flashinfer64_direct_macro_csr="${FLASHINFER64_DIRECT_MACRO_CSR:-True}"
+flashinfer64_residual_backend="${FLASHINFER64_RESIDUAL_BACKEND:-micro}"
+flashinfer64_rode_cache="${FLASHINFER64_RODE_CACHE:-False}"
+flashinfer64_parallel_core_residual="${FLASHINFER64_PARALLEL_CORE_RESIDUAL:-False}"
+export FLASHINFER64_RESIDUAL_BACKEND="$flashinfer64_residual_backend"
+export FLASHINFER64_RODE_CACHE="$flashinfer64_rode_cache"
+export FLASHINFER64_PARALLEL_CORE_RESIDUAL="$flashinfer64_parallel_core_residual"
 # The current best direct-CSR schedule is one CTA per CSR row.  Set this in
 # the wrapper (and export it) so the effective value is reproducible even when
 # the caller does not specify the variable explicitly.
@@ -81,10 +93,12 @@ rest_steps="${REST_STEPS:-0}"
 skip_steps2="${SKIP_STEPS2:-0}"
 attention_debug_dir="${ATTENTION_DEBUG_DIR:-}"
 attention_debug_step="${ATTENTION_DEBUG_STEP:--1}"
+attention_debug_steps="${ATTENTION_DEBUG_STEPS:-}"
 attention_debug_layers="${ATTENTION_DEBUG_LAYERS:-0}"
 attention_debug_stop="${ATTENTION_DEBUG_STOP:-True}"
 block_mask_dir="${BLOCK_MASK_DIR:-}"
 block_mask_heads="${BLOCK_MASK_HEADS:-0}"
+replay_mask_dir="${FLASHINFER64_REPLAY_MASK_DIR:-}"
 subblock_profile_dir="${SUBBLOCK_PROFILE_DIR:-}"
 subblock_profile_masses="${SUBBLOCK_PROFILE_MASSES:-0.9}"
 if [ "$sparse_execution" = "flashinfer64" ]; then
@@ -95,11 +109,14 @@ if [ "$sparse_execution" = "flashinfer64" ]; then
             flashinfer64_route_tag="fineratio${flashinfer64_fine_top_ratio}_tau${flashinfer64_promotion_threshold}"
         fi
     elif [ "$flashinfer64_route_mode" = "topk_topp" ]; then
-        flashinfer64_route_tag="tilekratio${flashinfer64_tile_top_ratio}_totaltopp${flashinfer64_token_top_p}_promote${flashinfer64_promotion_threshold}"
+        flashinfer64_route_tag="tilekratio${flashinfer64_tile_top_ratio}_dynamic${flashinfer64_dynamic_tile_ratio}_dcrt${sparsity_dcrt}_totaltopp${flashinfer64_token_top_p}_score${flashinfer64_residual_scorer}_temp${flashinfer64_residual_temperature}_promote${flashinfer64_promotion_threshold}"
     else
-        flashinfer64_route_tag="topp${flashinfer64_top_p}_totaltopp${flashinfer64_token_top_p}_promote${flashinfer64_promotion_threshold}"
+        flashinfer64_route_tag="topp${flashinfer64_top_p}_totaltopp${flashinfer64_token_top_p}_score${flashinfer64_residual_scorer}_temp${flashinfer64_residual_temperature}_promote${flashinfer64_promotion_threshold}"
     fi
-    default_output_dir="${res_root}/flashinfer64/${dataset_name}/${model_name}/seed${seed}_${flashinfer64_route_tag}_${order}_${height}_routecache${flashinfer64_route_cache}_coreonly${flashinfer64_core_only}_directcsr${flashinfer64_direct_macro_csr}_ctamul${flashinfer_csr_expand_cta_multiplier}_cache${cache_interval}"
+    if [ "$flashinfer64_dense_layer" -ge 0 ] 2>/dev/null && [ -n "$flashinfer64_dense_heads" ]; then
+        flashinfer64_route_tag="${flashinfer64_route_tag}_denseL${flashinfer64_dense_layer}H${flashinfer64_dense_heads//,/x}"
+    fi
+    default_output_dir="${res_root}/flashinfer64/${dataset_name}/${model_name}/seed${seed}_${flashinfer64_route_tag}_resbackend${flashinfer64_residual_backend}_rodecache${flashinfer64_rode_cache}_parallel${flashinfer64_parallel_core_residual}_${order}_${height}_routecache${flashinfer64_route_cache}_coreonly${flashinfer64_core_only}_directcsr${flashinfer64_direct_macro_csr}_ctamul${flashinfer_csr_expand_cta_multiplier}_cache${cache_interval}"
     if [ -n "${OUTPUT_DIR:-}" ]; then
         output_dir="${OUTPUT_DIR%/}"
         case "$output_dir" in
@@ -140,6 +157,20 @@ for prompt_idx in $(seq "$start_idx" "$end_idx"); do
 
     echo "Processing prompt $prompt_idx..."
 
+    # Replay masks are prompt-specific and are consumed by the FlashInfer64
+    # residual builder.  Each prompt is a separate Python process, so setting
+    # the file just before launch keeps Oracle/Proxy/Random routes isolated.
+    if [ -n "$replay_mask_dir" ]; then
+        replay_mask_file="$replay_mask_dir/prompt_${prompt_idx}.json"
+        if [ ! -f "$replay_mask_file" ]; then
+            echo "ERROR: replay mask not found: $replay_mask_file"
+            exit 1
+        fi
+        export FLASHINFER64_REPLAY_MASK_FILE="$replay_mask_file"
+    else
+        unset FLASHINFER64_REPLAY_MASK_FILE || true
+    fi
+
     block_mask_args=()
     if [ -n "$block_mask_dir" ]; then
         block_mask_args=(
@@ -165,13 +196,25 @@ for prompt_idx in $(seq "$start_idx" "$end_idx"); do
         --flashinfer64_route_mode "$flashinfer64_route_mode"
         --flashinfer64_top_p "$flashinfer64_top_p"
         --flashinfer64_tile_top_ratio "$flashinfer64_tile_top_ratio"
+        --flashinfer64_dynamic_tile_ratio "$flashinfer64_dynamic_tile_ratio"
         --flashinfer64_fine_top_ratio "$flashinfer64_fine_top_ratio"
         --flashinfer64_token_top_p "$flashinfer64_token_top_p"
         --flashinfer64_token_top_ratio "$flashinfer64_token_top_ratio"
         --flashinfer64_promotion_threshold "$flashinfer64_promotion_threshold"
+        --flashinfer64_dense_layer "$flashinfer64_dense_layer"
         --flashinfer64_route_cache "$flashinfer64_route_cache"
         --flashinfer64_core_only "$flashinfer64_core_only"
         --flashinfer64_direct_macro_csr "$flashinfer64_direct_macro_csr"
+    )
+    if [ -n "$flashinfer64_dense_heads" ]; then
+        flashinfer64_args+=(--flashinfer64_dense_heads "$flashinfer64_dense_heads")
+    fi
+    if [ -n "$flashinfer64_high_omission_heads_file" ]; then
+        flashinfer64_args+=(--flashinfer64_high_omission_heads_file "$flashinfer64_high_omission_heads_file")
+    fi
+    flashinfer64_args+=(
+        --flashinfer64_residual_scorer "$flashinfer64_residual_scorer"
+        --flashinfer64_residual_temperature "$flashinfer64_residual_temperature"
     )
     if [ -n "$flashinfer64_fine_top_k_override" ]; then
         flashinfer64_args+=(--flashinfer64_fine_top_k "$flashinfer64_fine_top_k_override")
@@ -187,6 +230,9 @@ for prompt_idx in $(seq "$start_idx" "$end_idx"); do
             --attention_debug_layers "$attention_debug_layers"
             --attention_debug_stop "$attention_debug_stop"
         )
+        if [ -n "$attention_debug_steps" ]; then
+            attention_debug_args+=(--attention_debug_steps "$attention_debug_steps")
+        fi
     fi
     python "${REPO_ROOT}/hyvideo_t2v_inference.py" \
         --model_id "$model_id" \
