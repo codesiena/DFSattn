@@ -69,6 +69,8 @@ class HunyuanVideo_DFSAttn_Processor2_0:
         flashinfer64_high_omission_heads_file=None,
         flashinfer64_residual_scorer="proxy",
         flashinfer64_residual_temperature=1.0,
+        flashinfer64_residual_min_top_k=20,
+        flashinfer64_residual_max_top_k=32,
         flashinfer64_route_cache=False,
         flashinfer64_core_only=False,
         flashinfer64_direct_macro_csr=True,
@@ -117,6 +119,8 @@ class HunyuanVideo_DFSAttn_Processor2_0:
         self.flashinfer64_high_omission_heads_file = flashinfer64_high_omission_heads_file
         self.flashinfer64_residual_scorer = flashinfer64_residual_scorer
         self.flashinfer64_residual_temperature = flashinfer64_residual_temperature
+        self.flashinfer64_residual_min_top_k = flashinfer64_residual_min_top_k
+        self.flashinfer64_residual_max_top_k = flashinfer64_residual_max_top_k
         self.flashinfer64_route_cache = flashinfer64_route_cache
         self.flashinfer64_core_only = flashinfer64_core_only
         self.flashinfer64_direct_macro_csr = flashinfer64_direct_macro_csr
@@ -362,6 +366,8 @@ class HunyuanVideo_DFSAttn_Processor2_0:
                     flashinfer64_high_omission_heads_file=self.flashinfer64_high_omission_heads_file,
                     flashinfer64_residual_scorer=self.flashinfer64_residual_scorer,
                     flashinfer64_residual_temperature=self.flashinfer64_residual_temperature,
+                    flashinfer64_residual_min_top_k=self.flashinfer64_residual_min_top_k,
+                    flashinfer64_residual_max_top_k=self.flashinfer64_residual_max_top_k,
                     flashinfer64_route_cache=self.flashinfer64_route_cache,
                     flashinfer64_core_only=self.flashinfer64_core_only,
                     flashinfer64_direct_macro_csr=self.flashinfer64_direct_macro_csr,

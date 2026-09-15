@@ -1787,6 +1787,8 @@ class FlashInfer64Attention:
         high_omission_heads_file: Optional[str] = None,
         residual_scorer: str = "proxy",
         residual_temperature: float = 1.0,
+        residual_min_top_k: int = 20,
+        residual_max_top_k: int = 32,
         reuse_route: bool = False,
         core_only: bool = False,
         direct_macro_csr: bool = True,
@@ -1801,6 +1803,10 @@ class FlashInfer64Attention:
             )
         if residual_temperature <= 0:
             raise ValueError("residual_temperature must be positive")
+        if residual_min_top_k < 0 or residual_max_top_k < 0:
+            raise ValueError("residual Top-k bounds must be non-negative")
+        if residual_min_top_k > residual_max_top_k:
+            raise ValueError("residual_min_top_k cannot exceed residual_max_top_k")
         residual_backend = os.environ.get(
             "FLASHINFER64_RESIDUAL_BACKEND", "micro"
         ).lower()
@@ -1838,7 +1844,10 @@ class FlashInfer64Attention:
             )
         high_omission_heads = high_omission_heads_by_layer.get(layer_idx, ())
         residual_scorer_key = (
-            residual_scorer, float(residual_temperature)
+            residual_scorer,
+            float(residual_temperature),
+            int(residual_min_top_k),
+            int(residual_max_top_k),
         ) if route_mode in ("topp_topk", "topk_topp") else ()
         dense_heads_key = ()
         if route_mode == "topp_topk" and dense_layer == layer_idx:
@@ -2074,8 +2083,8 @@ class FlashInfer64Attention:
                             core,
                             total_top_p=token_top_p,
                             head_mask=risk_head_mask,
-                            min_top_k=20 if high_omission_heads else 0,
-                            max_top_k=32 if high_omission_heads else None,
+                            min_top_k=residual_min_top_k if high_omission_heads else 0,
+                            max_top_k=residual_max_top_k if high_omission_heads else None,
                             score_overrides=score_overrides,
                         )
                     _timing_stop(timing_recorder, residual_select_start, "flashinfer_residual_select", step_idx, layer_idx, q.device)

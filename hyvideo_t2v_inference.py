@@ -86,6 +86,8 @@ def parse_args():
     parser.add_argument("--flashinfer64_high_omission_heads_file", type=str, default=None, help="Editable 0-based Layer/Head file for hierarchical Residual checks (default: importanthead/high_omission_heads.txt).")
     parser.add_argument("--flashinfer64_residual_scorer", choices=["proxy", "sampled_lse"], default="proxy", help="Residual scorer for configured high-omission heads: existing mean proxy or method sampled-LSE.")
     parser.add_argument("--flashinfer64_residual_temperature", type=float, default=1.0, help="Temperature for the sampled-LSE Residual scorer (default: 1.0).")
+    parser.add_argument("--flashinfer64_residual_min_top_k", type=int, default=20, help="Minimum complement K16 tiles retained per risk-head Q16 row.")
+    parser.add_argument("--flashinfer64_residual_max_top_k", type=int, default=32, help="Maximum complement K16 tiles retained per risk-head Q16 row.")
     parser.add_argument("--flashinfer64_route_cache", type=str2bool, default=False, help="Reuse compact routes across cache intervals. With direct macro CSR this also reuses each layer's FA3 scheduler plan; False rebuilds routes/plans in bounded-memory mode.")
     parser.add_argument("--flashinfer64_core_only", type=str2bool, default=False, help="Ablation: run only macro Q128xK96 Core and skip Residual/promotion/LSE merge.")
     parser.add_argument("--flashinfer64_direct_macro_csr", type=str2bool, default=True, help="Cache a compact per-layer macro-CSR FA3 plan and bypass repeated VariableBlock token expansion/planning.")
@@ -148,6 +150,10 @@ def parse_args():
         parser.error("--flashinfer64_token_top_p must be in [0, 1].")
     if args.flashinfer64_residual_temperature <= 0:
         parser.error("--flashinfer64_residual_temperature must be positive.")
+    if args.flashinfer64_residual_min_top_k < 0 or args.flashinfer64_residual_max_top_k < 0:
+        parser.error("Residual Top-k bounds must be non-negative.")
+    if args.flashinfer64_residual_min_top_k > args.flashinfer64_residual_max_top_k:
+        parser.error("--flashinfer64_residual_min_top_k cannot exceed --flashinfer64_residual_max_top_k.")
     if not 1 <= args.flashinfer64_promotion_threshold <= 48:
         parser.error("--flashinfer64_promotion_threshold must be in [1, 48].")
     if args.flashinfer64_dense_layer < -1:
@@ -278,6 +284,8 @@ if __name__ == "__main__":
                 args.flashinfer64_high_omission_heads_file,
                 args.flashinfer64_residual_scorer,
                 args.flashinfer64_residual_temperature,
+                args.flashinfer64_residual_min_top_k,
+                args.flashinfer64_residual_max_top_k,
                 args.flashinfer64_route_cache,
                 args.flashinfer64_core_only,
                 args.flashinfer64_direct_macro_csr,

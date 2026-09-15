@@ -1,0 +1,8 @@
+# 0-based Layer/Head risk prior.
+# Current Top-5 plus risk-sum-ranked candidates; N=5.
+# Format: Layer<layer> / Head<head>
+Layer43 / Head17
+Layer30 / Head13
+Layer48 / Head5
+Layer8 / Head10
+Layer12 / Head5

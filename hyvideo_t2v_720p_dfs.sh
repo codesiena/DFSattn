@@ -37,6 +37,8 @@ flashinfer64_dense_heads="${FLASHINFER64_DENSE_HEADS:-}"
 flashinfer64_high_omission_heads_file="${FLASHINFER64_HIGH_OMISSION_HEADS_FILE:-}"
 flashinfer64_residual_scorer="${FLASHINFER64_RESIDUAL_SCORER:-proxy}"
 flashinfer64_residual_temperature="${FLASHINFER64_RESIDUAL_TEMPERATURE:-1.0}"
+flashinfer64_residual_min_top_k="${FLASHINFER64_RESIDUAL_MIN_TOP_K:-20}"
+flashinfer64_residual_max_top_k="${FLASHINFER64_RESIDUAL_MAX_TOP_K:-32}"
 flashinfer64_route_cache="${FLASHINFER64_ROUTE_CACHE:-False}"
 flashinfer64_core_only="${FLASHINFER64_CORE_ONLY:-True}"
 flashinfer64_direct_macro_csr="${FLASHINFER64_DIRECT_MACRO_CSR:-True}"
@@ -109,7 +111,7 @@ if [ "$sparse_execution" = "flashinfer64" ]; then
             flashinfer64_route_tag="fineratio${flashinfer64_fine_top_ratio}_tau${flashinfer64_promotion_threshold}"
         fi
     elif [ "$flashinfer64_route_mode" = "topk_topp" ]; then
-        flashinfer64_route_tag="tilekratio${flashinfer64_tile_top_ratio}_dynamic${flashinfer64_dynamic_tile_ratio}_dcrt${sparsity_dcrt}_totaltopp${flashinfer64_token_top_p}_score${flashinfer64_residual_scorer}_temp${flashinfer64_residual_temperature}_promote${flashinfer64_promotion_threshold}"
+        flashinfer64_route_tag="tilekratio${flashinfer64_tile_top_ratio}_dynamic${flashinfer64_dynamic_tile_ratio}_dcrt${sparsity_dcrt}_totaltopp${flashinfer64_token_top_p}_score${flashinfer64_residual_scorer}_temp${flashinfer64_residual_temperature}_mink${flashinfer64_residual_min_top_k}_maxk${flashinfer64_residual_max_top_k}_promote${flashinfer64_promotion_threshold}"
     else
         flashinfer64_route_tag="topp${flashinfer64_top_p}_totaltopp${flashinfer64_token_top_p}_score${flashinfer64_residual_scorer}_temp${flashinfer64_residual_temperature}_promote${flashinfer64_promotion_threshold}"
     fi
@@ -215,6 +217,8 @@ for prompt_idx in $(seq "$start_idx" "$end_idx"); do
     flashinfer64_args+=(
         --flashinfer64_residual_scorer "$flashinfer64_residual_scorer"
         --flashinfer64_residual_temperature "$flashinfer64_residual_temperature"
+        --flashinfer64_residual_min_top_k "$flashinfer64_residual_min_top_k"
+        --flashinfer64_residual_max_top_k "$flashinfer64_residual_max_top_k"
     )
     if [ -n "$flashinfer64_fine_top_k_override" ]; then
         flashinfer64_args+=(--flashinfer64_fine_top_k "$flashinfer64_fine_top_k_override")

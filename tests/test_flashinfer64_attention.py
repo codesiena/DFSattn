@@ -709,6 +709,22 @@ class FlashInfer64AttentionTest(unittest.TestCase):
         self.assertTrue(bool((residual.sum(-1) == 1).all()))
         self.assertTrue(bool(residual[..., 6].all()))
 
+    def test_residual_topk_bounds_control_forced_budget(self) -> None:
+        micro = torch.full((1, 8, 12), 1.0 / 12.0)
+        core = torch.tensor([[[True, False]]])
+        no_floor = _select_residual_to_total_mass(
+            micro, core, total_top_p=0.40, min_top_k=0, max_top_k=32,
+        )
+        floor_four = _select_residual_to_total_mass(
+            micro, core, total_top_p=0.40, min_top_k=4, max_top_k=32,
+        )
+        capped_two = _select_residual_to_total_mass(
+            micro, core, total_top_p=1.0, min_top_k=0, max_top_k=2,
+        )
+        self.assertTrue(bool((no_floor.sum(-1) == 0).all()))
+        self.assertTrue(bool((floor_four.sum(-1) == 4).all()))
+        self.assertTrue(bool((capped_two.sum(-1) == 2).all()))
+
     def test_cpu_fallback_reuses_route_but_rebuilds_reference_plan(self) -> None:
         torch.manual_seed(9)
         q = torch.randn(1, 2, 193, 16)
