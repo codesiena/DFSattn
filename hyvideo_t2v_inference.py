@@ -104,7 +104,12 @@ def parse_args():
     parser.add_argument("--dense_warmup_output", type=str, default=None, help="Output path for the post-dense-warmup video")
     parser.add_argument("--record_density", type=str2bool, default=False, help="Record the actual density of sparse attention masks per step")
     parser.add_argument("--record_timing", type=str2bool, default=False, help="Record video-level CUDA-event totals for Top-k and attention execution")
-    parser.add_argument("--timing_csv", type=str, default=None, help="CSV path for video-level timing totals (default: timing.csv beside output_file)")
+    parser.add_argument(
+        "--timing_csv",
+        type=str,
+        default=None,
+        help="CSV path for video-level timing totals (default: <output_file stem>_timing.csv)",
+    )
     parser.add_argument("--attention_debug_dir", type=str, default=None, help="Dump exact Q/K/V, sparse output, and same-input dense output at the first sparse step.")
     parser.add_argument("--attention_debug_step", type=int, default=-1, help="Diffusion step to dump (-1 means --skip_steps).")
     parser.add_argument("--attention_debug_steps", type=parse_layer_indices, default=None, help="Optional comma-separated diffusion steps to dump in one run; overrides --attention_debug_step.")
@@ -366,7 +371,7 @@ if __name__ == "__main__":
         os.makedirs(output_dir, exist_ok=True)
 
     if args.record_timing:
-        timing_path = args.timing_csv or os.path.join(output_dir or ".", "timing.csv")
+        timing_path = args.timing_csv or f"{os.path.splitext(args.output_file)[0]}_timing.csv"
         extra_totals = {"e2e_generation_wall": total_generation_time * 1_000.0}
         if e2e_gpu_ms is not None:
             extra_totals["e2e_generation_gpu"] = e2e_gpu_ms

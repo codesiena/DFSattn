@@ -64,7 +64,14 @@ def load_prompt_or_image(prompt_source, prompt_idx, prompt, image_path):
         with open(prompt, "r") as f:
             prompts = f.readlines()
 
-        prompt = prompts[prompt_idx]
+        # Standard VBench files contain one prompt per line.  The VBench-66
+        # file distributed with Sparse-VideoGen stores metadata as
+        # ``category|local_id|prompt``; keep the line index as the global
+        # prompt index but pass only the actual prompt text to the pipeline.
+        prompt = prompts[prompt_idx].rstrip("\r\n")
+        fields = prompt.split("|", 2)
+        if len(fields) == 3 and fields[1].strip().isdigit():
+            prompt = fields[2].strip()
         return prompt, None
     elif prompt_source in ["T2V_Xingyang_Motion", "T2V_Xingyang_VBench"]:
         assert prompt.endswith(".txt"), "Prompt must be a txt file"

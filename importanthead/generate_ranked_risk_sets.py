@@ -17,9 +17,9 @@ CURRENT_TOP5 = (
     (8, 10),
     (12, 5),
 )
-# Breadth sweep sizes used by the quick priority experiment.  The generator
-# still writes risk_all1440.txt and the random negative control below.
-SET_SIZES = (5, 100, 300, 600, 1000)
+# Breadth sweep sizes used by the priority experiment.  The generator still
+# writes risk_all1440.txt and the random negative controls below.
+SET_SIZES = (5, 100, 300, 600, 800, 1000)
 
 
 def write_set(path: Path, pairs: list[tuple[int, int]], description: str) -> None:
@@ -98,13 +98,14 @@ def main() -> None:
         "All 60x24 Layer/Head pairs.",
     )
     rng = np.random.default_rng(args.random_seed)
-    random_ids = rng.choice(60 * 24, size=300, replace=False)
-    random_pairs = sorted((int(i // 24), int(i % 24)) for i in random_ids)
-    write_set(
-        args.output_dir / "risk_random300_seed20260915.txt",
-        random_pairs,
-        "Random N=300 negative control; seed=20260915.",
-    )
+    for random_size in (300, 800):
+        random_ids = rng.choice(60 * 24, size=random_size, replace=False)
+        random_pairs = sorted((int(i // 24), int(i % 24)) for i in random_ids)
+        write_set(
+            args.output_dir / f"risk_random{random_size}_seed20260915.txt",
+            random_pairs,
+            f"Random N={random_size} negative control; seed=20260915.",
+        )
     print(f"Wrote ranked risk sets to {args.output_dir}")
 
 

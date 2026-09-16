@@ -66,7 +66,12 @@ def parse_args():
     parser.add_argument("--record_density", type=str2bool, default=False, help="Record the actual density of sparse attention masks per step")
     parser.add_argument("--density_csv", type=str, default=None, help="CSV path for per-step execution-tile metrics")
     parser.add_argument("--record_timing", type=str2bool, default=True, help="Record video-level CUDA-event totals for Top-k and attention execution")
-    parser.add_argument("--timing_csv", type=str, default=None, help="CSV path for video-level timing totals (default: timing.csv beside output_file)")
+    parser.add_argument(
+        "--timing_csv",
+        type=str,
+        default=None,
+        help="CSV path for video-level timing totals (default: <output_file stem>_timing.csv)",
+    )
     parser.add_argument("--block_mask_dir", type=str, default=None, help="Root directory for top-k masks; a prompt-number/text subdirectory is created automatically")
     parser.add_argument("--block_mask_heads", type=parse_mask_heads, default=(0,), help="Comma-separated heads to render as heatmaps, or 'all'")
     parser.add_argument("--block_mask_layer_interval", type=int, default=15, help="Export every Nth layer (default: layers 0, 15, 30, ...)")
@@ -231,7 +236,7 @@ if __name__ == "__main__":
         os.makedirs(output_dir, exist_ok=True)
 
     if args.record_timing:
-        timing_path = args.timing_csv or os.path.join(output_dir or ".", "timing.csv")
+        timing_path = args.timing_csv or f"{os.path.splitext(args.output_file)[0]}_timing.csv"
         extra_totals = {"e2e_generation_wall": total_generation_time * 1_000.0}
         if e2e_gpu_ms is not None:
             extra_totals["e2e_generation_gpu"] = e2e_gpu_ms

@@ -77,6 +77,8 @@ dataset_name="${DATASET_NAME:-vbench_${prompt_set}}"
 model_name="${MODEL_NAME:-HunyuanVideo}"
 if [ "$prompt_set" = "33" ]; then
     default_prompt_file="${REPO_ROOT}/examples/vbench_33_prompts.txt"
+elif [ "$prompt_set" = "66" ]; then
+    default_prompt_file="/cnic/work/liutt/mywork/attention/Sparse-VideoGen/data/vbench_data/vbench_66_prompts.txt"
 else
     default_prompt_file="${REPO_ROOT}/examples/vbench_11_prompts.txt"
 fi
@@ -144,6 +146,10 @@ if [ ! -f "$prompt_file" ]; then
 fi
 
 num_prompts=$(wc -l < "$prompt_file")
+if [ "$prompt_set" = "66" ] && [ "$num_prompts" -ne 66 ]; then
+    echo "ERROR: vbench66 prompt file must contain 66 lines, found $num_prompts: $prompt_file"
+    exit 1
+fi
 end_idx="${END_IDX:-$((num_prompts - 1))}"
 
 echo "Found $num_prompts prompts in $prompt_file"
@@ -268,6 +274,7 @@ for prompt_idx in $(seq "$start_idx" "$end_idx"); do
         --skip_steps2 "$skip_steps2" \
         --record_density "$record_density" \
         --record_timing "$record_timing" \
+        --timing_csv "${out_file%.mp4}_timing.csv" \
         "${flashinfer64_args[@]}" \
         "${attention_debug_args[@]}" \
         "${block_top_p_args[@]}" \

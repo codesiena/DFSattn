@@ -74,8 +74,8 @@ run_prompt() {
         /usr/bin/time -f "wall_seconds=%e user_seconds=%U sys_seconds=%S" \
         -o "${output_dir}/wall_prompt${prompt_idx}.txt" \
         bash "${REPO_ROOT}/hyvideo_t2v_720p_dfs.sh"; then
-        if [ -f "${output_dir}/timing.csv" ]; then
-            cp "${output_dir}/timing.csv" "${output_dir}/timing_prompt${prompt_idx}.csv"
+        if [ -f "${output_dir}/${prompt_idx}_timing.csv" ]; then
+            cp "${output_dir}/${prompt_idx}_timing.csv" "${output_dir}/timing_prompt${prompt_idx}.csv"
         fi
         echo "[$(date '+%F %T')] DONE  name=${name} seed=${seed} prompt=${prompt_idx}"
     else
@@ -85,11 +85,16 @@ run_prompt() {
 }
 
 RISK_BREADTH_CONFIGS=(
+    # Existing breadth baseline points; run_prompt skips completed videos.
     n5_proxy_k20_32
     n100_proxy_k20_32
     n300_proxy_k20_32
     n600_proxy_k20_32
+    # New priority experiments: breadth, endpoint, matched-budget, random control.
+    n800_proxy_k20_32
     n1000_proxy_k20_32
+    n1000_proxy_k16_26
+    random800_proxy_k20_32
 )
 
 run_config_prompt() {
@@ -100,13 +105,17 @@ run_config_prompt() {
         n100_proxy_k20_32)  run_prompt "$config" "$RISK_ROOT/risk_top100.txt" 20 32 proxy 24 0 "$prompt_idx" ;;
         n300_proxy_k20_32)  run_prompt "$config" "$RISK_ROOT/risk_top300.txt" 20 32 proxy 24 0 "$prompt_idx" ;;
         n600_proxy_k20_32)  run_prompt "$config" "$RISK_ROOT/risk_top600.txt" 20 32 proxy 24 0 "$prompt_idx" ;;
+        n800_proxy_k20_32)  run_prompt "$config" "$RISK_ROOT/risk_top800.txt" 20 32 proxy 24 0 "$prompt_idx" ;;
         n1000_proxy_k20_32) run_prompt "$config" "$RISK_ROOT/risk_top1000.txt" 20 32 proxy 24 0 "$prompt_idx" ;;
+        n1000_proxy_k16_26) run_prompt "$config" "$RISK_ROOT/risk_top1000.txt" 16 26 proxy 24 0 "$prompt_idx" ;;
+        random800_proxy_k20_32) run_prompt "$config" "$RISK_ROOT/risk_random800_seed20260915.txt" 20 32 proxy 24 0 "$prompt_idx" ;;
         *) echo "Unknown config: $config"; return 2 ;;
     esac
 }
 
-echo "Priority phase: fixed risk-head breadth sweep, 5 configurations x 3 prompts = 15 videos"
-echo "Risk-head counts: N=5, 100, 300, 600, 1000; prompts: 0, 7, 18"
+echo "Priority phase: fixed risk-head breadth/depth sweep, 8 configurations x 3 prompts = 24 videos"
+echo "Configurations: n5/n100/n300/n600/n800/n1000 (k20-32), n1000 (k16-26), random800 (k20-32)"
+echo "Prompts: 0, 7, 18"
 for config in "${RISK_BREADTH_CONFIGS[@]}"; do
     for prompt_idx in 0 7 18; do
         run_config_prompt "$config" "$prompt_idx"
