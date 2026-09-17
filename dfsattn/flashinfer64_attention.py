@@ -63,7 +63,12 @@ MICRO = 16
 Q_MICROS_PER_MACRO = Q_MACRO // MICRO
 K_MICROS_PER_MACRO = K_MACRO // MICRO
 BLOCK_SIZE = Q_MACRO  # historical compatibility only
-RESIDUAL_BUCKET_CAPS = (4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
+# Keep tighter capacities in the long-row region where power-of-two buckets
+# otherwise waste up to almost half of every program's static loop slots.
+RESIDUAL_BUCKET_CAPS = (
+    4, 8, 16, 32, 64, 128, 192, 256, 384, 512, 1024, 2048, 4096,
+)
+RESIDUAL_SPLIT_MIN_CAPACITY = 128
 OCCUPANCY_TAU_SWEEP = (8, 16, 24, 32, 40, 48)
 
 # The compatibility VariableBlock path keeps one model-wide ephemeral wrapper.
@@ -856,6 +861,38 @@ def _select_residual_to_total_mass(
     return torch.zeros_like(covered_by_core).scatter_(-1, indices, keep)
 
 
+def _randomize_residual_support_matched_count(
+    residual: torch.Tensor,
+    micro_scores: torch.Tensor,
+    core_mask: torch.Tensor,
+    *,
+    seed: int,
+) -> torch.Tensor:
+    """Replace selected Residual tiles with a seeded random support of equal size.
+
+    The baseline proxy route determines the number of K16 tiles in every
+    (head, Q16) row (including its k=20--32 bounds).  This negative control
+    changes only *which* eligible non-Core tiles are retained.
+    """
+    _, q_micro, k_micro = micro_scores.shape
+    q_parent = torch.arange(q_micro, device=micro_scores.device) // Q_MICROS_PER_MACRO
+    k_parent = torch.arange(k_micro, device=micro_scores.device) // K_MICROS_PER_MACRO
+    eligible = (
+        ~core_mask[:, q_parent[:, None], k_parent[None, :]]
+        & (micro_scores > 0)
+    )
+    selected_count = residual.sum(dim=-1, keepdim=True)
+    generator = torch.Generator(device=micro_scores.device)
+    generator.manual_seed(int(seed))
+    random_scores = torch.rand(
+        micro_scores.shape, device=micro_scores.device, generator=generator
+    ).masked_fill(~eligible, -1.0)
+    _, indices = torch.sort(random_scores, dim=-1, descending=True, stable=True)
+    rank = torch.arange(k_micro, device=micro_scores.device)
+    keep = rank < selected_count
+    return torch.zeros_like(residual).scatter_(-1, indices, keep)
+
+
 def _promote_residual_microtiles(residual, core_mask, *, promotion_threshold):
     """Promote dense 8x6 residual groups and keep both supports disjoint."""
     max_occupancy = Q_MICROS_PER_MACRO * K_MICROS_PER_MACRO
@@ -971,6 +1008,17 @@ def _count_residual_csr_interactions(
     )
     interactions = (q_sizes * k_sizes).sum()
     return int(interactions.item()), int(residual_indices.numel())
+
+
+def _residual_split_chunk_capacity(bucket_capacity: int) -> int:
+    """Choose a bounded K16 loop for long-row partial attention programs."""
+    if bucket_capacity < RESIDUAL_SPLIT_MIN_CAPACITY:
+        return 0
+    if bucket_capacity <= 256:
+        return 64
+    if bucket_capacity <= 384:
+        return 96
+    return 128
 
 
 def _make_core_execution_mask(
@@ -1360,6 +1408,126 @@ if triton is not None:
         tl.store(lse_ptr + active_row * micro_size + rows, row_lse, mask=q_valid)
 
     @triton.jit
+    def _residual_micro_partial_kernel(
+        q_ptr, k_ptr, v_ptr, index_ptr, indptr_ptr, row_ids_ptr,
+        partial_out_ptr, partial_lse_ptr,
+        sequence, q_micro_blocks, k_micro_blocks,
+        stride_qh, stride_qs, stride_kh, stride_ks, stride_vh, stride_vs,
+        stride_por, stride_poc, stride_pos,
+        head_dim: tl.constexpr, block_d: tl.constexpr,
+        bucket_capacity: tl.constexpr, chunk_capacity: tl.constexpr,
+        num_chunks: tl.constexpr, micro_size: tl.constexpr,
+        scale: tl.constexpr,
+    ):
+        """Compute one exact online-softmax partial state per long-row chunk."""
+        row_pid = tl.program_id(0)
+        chunk_pid = tl.program_id(1)
+        csr_row = tl.load(row_ids_ptr + row_pid)
+        head, qb = csr_row // q_micro_blocks, csr_row % q_micro_blocks
+        row_start = tl.load(indptr_ptr + csr_row)
+        row_end = tl.load(indptr_ptr + csr_row + 1)
+        row_count = row_end - row_start
+        rows = tl.arange(0, micro_size)
+        cols = tl.arange(0, micro_size)
+        dims = tl.arange(0, block_d)
+        q_pos = qb * micro_size + rows
+        q_valid = q_pos < sequence
+        q = tl.load(
+            q_ptr + head * stride_qh + q_pos[:, None] * stride_qs + dims[None, :],
+            mask=q_valid[:, None] & (dims[None, :] < head_dim), other=0.0,
+        )
+        m = tl.full((micro_size,), float("-inf"), tl.float32)
+        l = tl.zeros((micro_size,), tl.float32)
+        acc = tl.zeros((micro_size, block_d), tl.float32)
+        for local_slot in range(0, chunk_capacity):
+            slot = chunk_pid * chunk_capacity + local_slot
+            slot_valid = (slot < row_count) & (slot < bucket_capacity)
+            kb = tl.load(
+                index_ptr + row_start + slot,
+                mask=slot_valid, other=k_micro_blocks,
+            )
+            k_pos = kb * micro_size + cols
+            k_valid = slot_valid & (kb < k_micro_blocks) & (k_pos < sequence)
+            kt = tl.load(
+                k_ptr + head * stride_kh + k_pos[None, :] * stride_ks + dims[:, None],
+                mask=k_valid[None, :] & (dims[:, None] < head_dim), other=0.0,
+            )
+            score = tl.dot(q, kt) * scale
+            pair_valid = q_valid[:, None] & k_valid[None, :]
+            score = tl.where(pair_valid, score, float("-inf"))
+            tile_m = tl.max(score, axis=1)
+            new_m = tl.maximum(m, tile_m)
+            alpha = tl.where(m != float("-inf"), tl.exp(m - new_m), 0.0)
+            weights = tl.where(pair_valid, tl.exp(score - new_m[:, None]), 0.0)
+            l = l * alpha + tl.sum(weights, axis=1)
+            acc = acc * alpha[:, None]
+            vv = tl.load(
+                v_ptr + head * stride_vh + k_pos[:, None] * stride_vs + dims[None, :],
+                mask=k_valid[:, None] & (dims[None, :] < head_dim), other=0.0,
+            )
+            acc += tl.dot(weights.to(vv.dtype), vv)
+            m = new_m
+        partial_output = acc / tl.maximum(l[:, None], 1.0e-20)
+        tl.store(
+            partial_out_ptr
+            + row_pid * stride_por + chunk_pid * stride_poc
+            + rows[:, None] * stride_pos + dims[None, :],
+            partial_output,
+            mask=q_valid[:, None] & (dims[None, :] < head_dim),
+        )
+        partial_lse = tl.where(l > 0, m + tl.log(l), float("-inf"))
+        tl.store(
+            partial_lse_ptr
+            + (row_pid * num_chunks + chunk_pid) * micro_size + rows,
+            partial_lse, mask=q_valid,
+        )
+
+    @triton.jit
+    def _residual_micro_partial_merge_kernel(
+        partial_out_ptr, partial_lse_ptr, out_ptr, lse_ptr,
+        stride_por, stride_poc, stride_pos, stride_oh, stride_os,
+        head_dim: tl.constexpr, block_d: tl.constexpr,
+        num_chunks: tl.constexpr, micro_size: tl.constexpr,
+    ):
+        """Merge long-row partial states using the exact LSE identity."""
+        pid = tl.program_id(0)
+        rows = tl.arange(0, micro_size)
+        dims = tl.arange(0, block_d)
+        m = tl.full((micro_size,), float("-inf"), tl.float32)
+        l = tl.zeros((micro_size,), tl.float32)
+        acc = tl.zeros((micro_size, block_d), tl.float32)
+        for chunk in range(0, num_chunks):
+            chunk_lse = tl.load(
+                partial_lse_ptr
+                + (pid * num_chunks + chunk) * micro_size + rows,
+            )
+            new_m = tl.maximum(m, chunk_lse)
+            old_weight = tl.where(
+                m != float("-inf"), tl.exp(m - new_m), 0.0,
+            )
+            chunk_weight = tl.where(
+                chunk_lse != float("-inf"), tl.exp(chunk_lse - new_m), 0.0,
+            )
+            chunk_output = tl.load(
+                partial_out_ptr
+                + pid * stride_por + chunk * stride_poc
+                + rows[:, None] * stride_pos + dims[None, :],
+                mask=dims[None, :] < head_dim, other=0.0,
+            ).to(tl.float32)
+            acc = (
+                acc * old_weight[:, None]
+                + chunk_output * chunk_weight[:, None]
+            )
+            l = l * old_weight + chunk_weight
+            m = new_m
+        output = acc / tl.maximum(l[:, None], 1.0e-20)
+        tl.store(
+            out_ptr + pid * stride_oh + rows[:, None] * stride_os + dims[None, :],
+            output, mask=dims[None, :] < head_dim,
+        )
+        tl.store(lse_ptr + pid * micro_size + rows, m + tl.log(l))
+
+    @triton.jit
     def _merge_lse_active_rows_kernel(
         core_out_ptr, core_lse_ptr, residual_out_ptr, residual_lse_ptr,
         active_rows_ptr, sequence, q_micro_blocks,
@@ -1597,18 +1765,69 @@ def _run_residual_micro(q, k, v, route, recorder=None, step=-1, layer=-1):
     lse = torch.empty(
         (active_count, MICRO), dtype=torch.float32, device=q.device
     )
+    split_min_capacity = int(os.environ.get(
+        "FLASHINFER64_RESIDUAL_SPLIT_MIN_CAPACITY",
+        str(RESIDUAL_SPLIT_MIN_CAPACITY),
+    ))
+    if split_min_capacity < 0:
+        raise ValueError(
+            "FLASHINFER64_RESIDUAL_SPLIT_MIN_CAPACITY must be non-negative"
+        )
     active_offset = 0
     for bucket_capacity, row_ids in route.residual_buckets:
         bucket_start = _timing_start(recorder, q.device)
-        _residual_micro_attention_kernel[(row_ids.numel(),)](
-            q, k, v, indices, route.residual_indptr, row_ids, output, lse,
-            sequence, q_micro_blocks, _ceil_div(sequence, MICRO), active_offset,
-            q.stride(0), q.stride(1), k.stride(0), k.stride(1),
-            v.stride(0), v.stride(1), output.stride(0), output.stride(1),
-            head_dim=dim, block_d=triton.next_power_of_2(dim),
-            bucket_capacity=bucket_capacity, micro_size=MICRO,
-            scale=dim ** -0.5, num_warps=4,
+        chunk_capacity = _residual_split_chunk_capacity(bucket_capacity)
+        split_bucket = bool(
+            split_min_capacity > 0
+            and bucket_capacity >= split_min_capacity
+            and chunk_capacity > 0
         )
+        if split_bucket:
+            bucket_rows = row_ids.numel()
+            num_chunks = _ceil_div(bucket_capacity, chunk_capacity)
+            # Partial O remains FP32 so the only output cast is the same final
+            # BF16/FP16 store used by the unsplit kernel.
+            partial_output = torch.empty(
+                (bucket_rows, num_chunks, MICRO, dim),
+                dtype=torch.float32, device=q.device,
+            )
+            partial_lse = torch.empty(
+                (bucket_rows, num_chunks, MICRO),
+                dtype=torch.float32, device=q.device,
+            )
+            _residual_micro_partial_kernel[(bucket_rows, num_chunks)](
+                q, k, v, indices, route.residual_indptr, row_ids,
+                partial_output, partial_lse,
+                sequence, q_micro_blocks, _ceil_div(sequence, MICRO),
+                q.stride(0), q.stride(1), k.stride(0), k.stride(1),
+                v.stride(0), v.stride(1),
+                partial_output.stride(0), partial_output.stride(1),
+                partial_output.stride(2),
+                head_dim=dim, block_d=triton.next_power_of_2(dim),
+                bucket_capacity=bucket_capacity,
+                chunk_capacity=chunk_capacity, num_chunks=num_chunks,
+                micro_size=MICRO, scale=dim ** -0.5, num_warps=4,
+            )
+            bucket_output = output.narrow(0, active_offset, bucket_rows)
+            bucket_lse = lse.narrow(0, active_offset, bucket_rows)
+            _residual_micro_partial_merge_kernel[(bucket_rows,)](
+                partial_output, partial_lse, bucket_output, bucket_lse,
+                partial_output.stride(0), partial_output.stride(1),
+                partial_output.stride(2), bucket_output.stride(0),
+                bucket_output.stride(1),
+                head_dim=dim, block_d=triton.next_power_of_2(dim),
+                num_chunks=num_chunks, micro_size=MICRO, num_warps=4,
+            )
+        else:
+            _residual_micro_attention_kernel[(row_ids.numel(),)](
+                q, k, v, indices, route.residual_indptr, row_ids, output, lse,
+                sequence, q_micro_blocks, _ceil_div(sequence, MICRO), active_offset,
+                q.stride(0), q.stride(1), k.stride(0), k.stride(1),
+                v.stride(0), v.stride(1), output.stride(0), output.stride(1),
+                head_dim=dim, block_d=triton.next_power_of_2(dim),
+                bucket_capacity=bucket_capacity, micro_size=MICRO,
+                scale=dim ** -0.5, num_warps=4,
+            )
         _timing_stop(
             recorder, bucket_start,
             f"flashinfer_residual_bucket_le{bucket_capacity}",
@@ -1797,9 +2016,12 @@ class FlashInfer64Attention:
         step_idx: int = -1, layer_idx: int = -1,
     ):
         del token_top_k, token_top_ratio  # retained only for old launch scripts
-        if residual_scorer not in ("proxy", "sampled_lse"):
+        if residual_scorer not in (
+            "proxy", "sampled_lse", "random", "sampled_lse_random"
+        ):
             raise ValueError(
-                "residual_scorer must be 'proxy' or 'sampled_lse'"
+                "residual_scorer must be 'proxy', 'sampled_lse', 'random', "
+                "or 'sampled_lse_random'"
             )
         if residual_temperature <= 0:
             raise ValueError("residual_temperature must be positive")
@@ -2056,7 +2278,9 @@ class FlashInfer64Attention:
                         if valid_risk_heads:
                             risk_head_mask[list(valid_risk_heads)] = True
                         score_overrides = None
-                        if residual_scorer == "sampled_lse" and valid_risk_heads:
+                        if residual_scorer in (
+                            "sampled_lse", "sampled_lse_random"
+                        ) and valid_risk_heads:
                             peak_score_start = _timing_start(timing_recorder, q.device)
                             peak_scores = compute_peak_aware_micro_tile_scores(
                                 qh[list(valid_risk_heads)],
@@ -2087,6 +2311,23 @@ class FlashInfer64Attention:
                             max_top_k=residual_max_top_k if high_omission_heads else None,
                             score_overrides=score_overrides,
                         )
+                        if residual_scorer in (
+                            "random", "sampled_lse_random"
+                        ) and valid_risk_heads:
+                            # Keep the same per-row Residual budget as the
+                            # selected scorer (proxy or sampled-LSE),
+                            # but draw the K16 tiles uniformly from the
+                            # remaining non-Core support.  A layer-dependent
+                            # seed avoids identical layouts across layers while
+                            # staying independent of diffusion RNG state.
+                            residual = _randomize_residual_support_matched_count(
+                                residual,
+                                micro_scores,
+                                core,
+                                seed=int(os.environ.get(
+                                    "FLASHINFER64_RANDOM_TOKEN_SEED", "20260916"
+                                )) + int(layer_idx) * 1009,
+                            )
                     _timing_stop(timing_recorder, residual_select_start, "flashinfer_residual_select", step_idx, layer_idx, q.device)
 
                     promotion_start = _timing_start(timing_recorder, q.device)

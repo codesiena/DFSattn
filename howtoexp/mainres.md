@@ -27,6 +27,11 @@
 
 ## ours vbench_33 完整 33 视频结果
 
+> **历史结果口径警告（2026-09-17）：** 本节旧表在 prompt 18 之后错误交换了
+> `scene`、`subject_consistency` 和 `temporal_flickering` 的 dense reference，不能用于
+> 计算完整 VBench33 平均质量。本文末尾“sampled-LSE 三阶段实验”使用 prompt 文件中的
+> `类别|编号` 重新配对，并以正确的 480p dense reference 重算；应以新表为准。
+
 该项目实际包含 `0.mp4`–`32.mp4` 共 33 个视频。以下按 `vbench_33_prompts.txt` 的顺序，每 3 个视频对应一个 VBench 维度的 dense reference；密度为对应 `density_summary.csv` 记录中的 `mean_final_density_sparse_steps_avg_over_layers`。
 
 | 视频 | dense reference | 密度 | PSNR ↑ | SSIM ↑ | LPIPS ↓ |
@@ -167,3 +172,207 @@
 | top1000 + k16–26 | 0.199559268 | 21.421689 | 0.728082 | 0.314678 | 383.723 |
 
 初步结论：四组配置的质量差异很小；`top1000 + k20–32` 密度最高，`random800 + k20–32` 的平均质量略好但 LPIPS 略差于 top1000 + k20–32。时间差异远大于质量差异，并且高度依赖 prompt：`random800` 的平均时间最低，但其 prompt 0 仍达到 `424.076 s`；`top1000 + k16–26` 的 prompt 18 达到 `546.141 s`。因此当前结果不能简单归因于密度或 Top-k 范围，仍需多次重复运行后再比较平均性能。
+
+## VBench66 n300 随机头与随机 token 消融
+
+本组消融的随机头和随机 token 配置已完成 VBench66 前 10 个 prompt（`0–9`）；正常
+n300 与 core-only 的完成范围分别为 `0–6` 和 `0–7`，后续公平比较仅使用它们共同完成的
+prompt `0–6`。视频质量以
+`/cnic/work/liutt/mywork/attention/ttresult/vbench/t2v/densep66/Step_50-Res_480p`
+中同 prompt 的 dense 视频为 reference，采用 `videometric.py` 逐帧对齐 129 帧计算
+PSNR、SSIM 与 Alex-LPIPS；密度来自各输出目录的 `density_summary.csv`，时间来自
+`<prompt>_timing.csv` 的 `e2e_generation_wall`。
+
+### 实验参数
+
+四组均使用 HunyuanVideo、seed `0`、`480×720`、129 frames、50 denoising steps、
+`SPARSE_EXECUTION=flashinfer64`、`ROUTE_MODE=topk_topp`、tile ratio `0.30`、
+dynamic ratio `True`、`SPARSITY_DCRT=0.10`、total Top-p `0.90`、Residual `k=20–32`、
+promotion threshold `24`、route cache `True`、direct macro CSR `True`、Residual backend
+`micro`、Hilbert3D，以及 `SKIP_STEPS=CACHE_INTERVAL=12`。正常方法为 **Top300 危险头 +
+proxy token 选择**，是以下三种单变量消融的公平基线：
+
+| 组别 | 危险头 | Residual token 选择 | 固定随机种子 | 输出目录 |
+|---|---|---|---:|---|
+| 正常 n300（基线） | risk-sum Top300 | proxy | — | `n300_proxy_k20_32` |
+| 随机 300 头 | 从全部 60×24 Layer/Head 中无放回随机选 300 | proxy（其余不变） | 20260915 | `n300_random_heads_k20_32` |
+| 随机 token | risk-sum Top300（不变） | 每个危险头/Q16 行在非-Core K16 tile 中随机选择 | 20260916 | `n300_random_tokens_k20_32` |
+| core-only | risk-sum Top300（不变） | 关闭 Residual add-back，只保留 Core | — | `n300_core_only` |
+
+随机 token 组先按 proxy 路由确定每个 `(head, Q16)` 行原本应保留的 tile 数（包括
+`k=20–32` 边界），再从可选的非-Core tile 中均匀无放回抽取相同数量。因此它与正常
+n300 匹配逐行 token 预算；随机化仅改变选中 tile 的位置。
+
+core-only 组不执行 Residual token 的 add-back（Residual count 为 0），其余 n300 的
+危险头选择和 Core 路由设置不变，因此用于检验 Residual 路径本身对质量、密度和时间的贡献。
+
+### 各组当前已完成视频结果
+
+| 组别 | 视频数 | 平均密度 | 平均 PSNR ↑ | 平均 SSIM ↑ | 平均 LPIPS ↓ | 平均 E2E(s) |
+|---|---:|---:|---:|---:|---:|---:|
+| 正常 Top300 + proxy（基线） | 7 | 0.196665408 | 26.424699 | 0.870908 | 0.096332 | 195.101 |
+| 随机 300 头 | 10 | 0.196434809 | 27.277528 | 0.881359 | 0.089492 | 195.479 |
+| Top300 内随机 token | 10 | 0.196558747 | 27.301258 | 0.881965 | 0.089863 | 197.733 |
+| Top300 + proxy core-only | 8 | 0.194485856 | 26.563506 | 0.872733 | 0.095041 | 190.470 |
+
+各组完成的视频范围不同（正常 n300 为 `0–6`、随机头/随机 token 为 `0–9`、core-only
+为 `0–7`），不能直接将上表相减；下面使用四个方法共同拥有的 7 个视频作严格单变量对照。
+
+### 公平对照：共同 prompt 0–6
+
+| 组别 | 视频数 | 平均密度 | 平均 PSNR ↑ | 平均 SSIM ↑ | 平均 LPIPS ↓ | 平均 E2E(s) |
+|---|---:|---:|---:|---:|---:|---:|
+| 正常 Top300 + proxy（基线） | 7 | 0.196665408 | 26.424699 | 0.870908 | 0.096332 | 195.101 |
+| 随机 300 头 | 7 | 0.196546007 | 26.391687 | 0.870549 | 0.097074 | 195.510 |
+| Top300 内随机 token | 7 | 0.196665483 | 26.406025 | 0.871051 | 0.097654 | 197.696 |
+| Top300 + proxy core-only | 7 | 0.194537218 | 26.285712 | 0.868167 | 0.100000 | 190.457 |
+
+| 相对正常 Top300 + proxy（共同 7 视频） | Δ密度 | ΔPSNR | ΔSSIM | ΔLPIPS | ΔE2E(s) |
+|---|---:|---:|---:|---:|---:|
+| 随机 300 头 | -0.000119401 | -0.033013 | -0.000359 | +0.000742 | +0.409 |
+| Top300 内随机 token | +0.000000075 | -0.018675 | +0.000143 | +0.001322 | +2.595 |
+| Top300 + proxy core-only | -0.002128190 | -0.138987 | -0.002741 | +0.003668 | -4.644 |
+
+结论：随机 300 头相对 Top300 的质量变化极小（PSNR 低 `0.033 dB`、LPIPS 高
+`0.000742`），在本次单次运行下未显示明显的危险头排序收益。随机 token 在几乎严格
+匹配密度的条件下 LPIPS 变差 `0.001322`，并慢 `2.595 s`（约 `1.33%`）；这说明 proxy
+token 位置选择存在小幅但可测的收益。core-only 则将密度降低 `0.002128190`，时间减少
+`4.644 s`（约 `2.38%`），但 PSNR 低 `0.138987 dB`、SSIM 低 `0.002741`、LPIPS 高
+`0.003668`，说明 Residual add-back 带来的质量收益大于其小幅时间代价。所有结果都应以
+重复运行排除 GPU 时钟与调度波动后再作强结论。
+
+## sampled-LSE 三阶段实验（2026-09-17）
+
+本轮实验结果根目录为：
+
+`/cnic/work/liutt/mywork/attention_time/res/hymor_sampled_lse_suite_20260917`
+
+质量统一使用
+`/cnic/work/liutt/mywork/attention/Sparse-VideoGen/metric/videometric.py`，按帧对齐 129 帧，
+计算 PSNR、SSIM 和 Alex-LPIPS；表中质量为先对每个视频的全部帧求均值，再对该配置的
+全部视频取算术平均。密度来自每组 `density_summary.csv` 的
+`mean_final_density_sparse_steps_avg_over_layers`，时间来自每个视频 `<id>_timing.csv` 的
+`e2e_generation_wall`。GPU 时间与 wall time 相差小于 `0.001 s`。
+
+共同生成参数为 HunyuanVideo、seed `0`、`480×720`、129 frames、50 denoising steps、
+`SPARSE_EXECUTION=flashinfer64`、`ROUTE_MODE=topk_topp`、tile ratio `0.30`、dynamic ratio
+`True`、`SPARSITY_DCRT=0.10`、sampled-LSE temperature `1.0`、Residual `k=20–32`、
+promotion threshold `24`、route cache `True`、direct macro CSR `True`、Residual backend
+`micro`、Hilbert3D，以及 `SKIP_STEPS=CACHE_INTERVAL=12`。
+
+### 第一阶段：VBench66 参数选择（每组 10 个视频）
+
+该阶段使用 Top600 风险头与 sampled-LSE，只改变 total Top-p；评测 prompt 为 VBench66
+的 `0–9`，dense reference 为：
+
+`/cnic/work/liutt/mywork/attention/ttresult/vbench/t2v/densep66/Step_50-Res_480p`
+
+| Total Top-p | 视频数 | 平均密度 | 平均 E2E(s) | 平均 PSNR ↑ | 平均 SSIM ↑ | 平均 LPIPS ↓ |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0.80 | 10 | 0.198158316 | 209.024 | 27.462743 | **0.879005** | 0.085606 |
+| 0.85 | 10 | 0.198313120 | **206.313** | 27.475436 | 0.878770 | 0.085575 |
+| 0.90 | 10 | 0.198495103 | 206.358 | 27.480280 | 0.878403 | 0.085497 |
+| 0.95 | 10 | 0.198715641 | 209.974 | **27.492177** | 0.878274 | **0.085327** |
+
+从 `p=0.80` 增加到 `0.95`，平均密度仅增加 `0.000557325`，PSNR 提高
+`0.029434 dB`、LPIPS 降低 `0.000279`，但 SSIM 反而降低 `0.000731`；质量差异很小。
+`p=0.95` 的 PSNR/LPIPS 最好但密度和时间最高，`p=0.85` 最快。综合密度、质量和时间，
+后续主结果固定使用 `p=0.90`；该选择是折中点，而不是三项质量指标均最优的点。
+
+### 第二阶段：VBench33 主结果（完整 33 视频）
+
+Top300/Top600 sampled-LSE 均固定 total Top-p `0.90`。正确 dense reference 为：
+
+`/cnic/work/liutt/mywork/attention/ttresult/vbench/t2v/dense/Step_50-Res_480p`
+
+prompt 与 reference 按 prompt 文件中的 `类别|类别内编号` 配对。此前使用
+`densep33/Step_50-Res_720p` 得到的约 `10.8 dB` PSNR 结果已经作废；此前将 prompt 18
+之后类别顺序配错而得到的 DFSAttn `23.462509` 和 Top600+proxy `23.813660` 也已作废。
+下面 DFSAttn 和 Top600+proxy 的质量均使用正确 480p reference 与正确类别映射重新计算。
+
+| 方法 | 视频数 | 平均密度 | 平均 E2E(s) | 平均 PSNR ↑ | 平均 SSIM ↑ | 平均 LPIPS ↓ |
+|---|---:|---:|---:|---:|---:|---:|
+| 原始 DFSAttn | 33 | 0.196712710 | 未记录 | 28.432356 | 0.885323 | 0.096305 |
+| Top600 + proxy | 33 | 0.198259178 | 198.213 | 28.890878 | **0.892962** | 0.087106 |
+| Top300 + sampled-LSE | 33 | 0.196518659 | 202.087 | 28.940509 | 0.890886 | 0.087089 |
+| Top600 + sampled-LSE | 33 | 0.198402256 | 206.683 | **29.015273** | 0.890673 | **0.086073** |
+
+Top600 sampled-LSE 相比 Top600 proxy：PSNR 提高 `0.124395 dB`、LPIPS 降低
+`0.001034`，但 SSIM 降低 `0.002289`，平均 E2E 增加 `8.470 s`，密度增加
+`0.000143078`。因此 sampled-LSE 在 PSNR/LPIPS 上略优于 proxy，但不是三项指标一致提升，
+并且付出了约 `4.27%` 的时间代价。
+
+Top600 sampled-LSE 相比 Top300 sampled-LSE：密度增加 `0.001883597`，平均 E2E 增加
+`4.596 s`；PSNR 提高 `0.074763 dB`、LPIPS 降低 `0.001017`，SSIM 降低
+`0.000213`。扩大到 600 个风险头带来了小幅 PSNR/LPIPS 收益，但幅度有限。
+
+相较原始 DFSAttn，Top600 sampled-LSE 的 PSNR 提高 `0.582917 dB`、SSIM 提高
+`0.005350`、LPIPS 降低 `0.010232`。由于该批原始 DFSAttn 没有逐视频 timing CSV，
+不能进行可靠的端到端速度比较。
+
+逐视频指标以及本轮八个配置的汇总保存在：
+
+`/cnic/work/liutt/mywork/attention_time/res/hymor_sampled_lse_suite_20260917/video_metrics_summary.csv`
+
+### 第三阶段：11 个相同视频的机制消融
+
+第三阶段使用 VBench33 的相同 11 个 prompt：`0,3,6,9,12,15,18,21,24,27,30`。
+三组均使用 total Top-p `0.90`、Residual `k=20–32` 及前述共同参数，质量均已使用正确的
+VBench33 480p dense reference 重新计算：
+
+`/cnic/work/liutt/mywork/attention/ttresult/vbench/t2v/dense/Step_50-Res_480p`
+
+三组机制定义如下：
+
+- **Top600 sampled-LSE 基线**：使用 risk-sum 排名前 600 的危险头，并按 sampled-LSE
+  选择 Residual K16 tile。
+- **随机 600 头**：从全部 60×24 Layer/Head 中无放回随机选 600 个头（seed
+  `20260915`），仍按 sampled-LSE 选择 Residual tile。
+- **等数量随机 token**：危险头仍为 Top600，先由 sampled-LSE 确定每个
+  `(head,Q16)` 行的 Residual tile 数量，再在可选非-Core tile 中随机选取相同数量
+  （seed `20260917`）。因此随机化改变 tile 位置而不改变逐行预算；最终密度仍可能因
+  后续 promotion 的空间聚集差异产生极小变化。
+
+#### 11 视频平均结果
+
+| 方法 | 视频数 | 平均密度 | 平均 E2E(s) | 平均 PSNR ↑ | 平均 SSIM ↑ | 平均 LPIPS ↓ |
+|---|---:|---:|---:|---:|---:|---:|
+| Top600 + sampled-LSE（基线） | 11 | 0.198352436 | 207.391 | **28.907922** | **0.900680** | **0.083894** |
+| 随机600头 + sampled-LSE | 11 | 0.198351087 | **206.409** | 28.723870 | 0.898160 | 0.089747 |
+| Top600 + sampled-LSE 等数量随机 token | 11 | 0.198437052 | 210.797 | 28.563881 | 0.899358 | 0.086954 |
+
+| 相对 Top600 sampled-LSE 基线 | Δ密度 | ΔE2E(s) | ΔPSNR | ΔSSIM | ΔLPIPS |
+|---|---:|---:|---:|---:|---:|
+| 随机600头 | -0.000001349 | -0.981 | -0.184052 | -0.002520 | +0.005853 |
+| 等数量随机 token | +0.000084616 | +3.407 | -0.344042 | -0.001322 | +0.003060 |
+
+#### 逐视频质量明细
+
+| Prompt | 基线 PSNR | 基线 SSIM | 基线 LPIPS | 随机头 PSNR | 随机头 SSIM | 随机头 LPIPS | 随机 token PSNR | 随机 token SSIM | 随机 token LPIPS |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 29.363542 | 0.900607 | 0.075879 | 29.088776 | 0.897956 | 0.083806 | 28.852623 | 0.896375 | 0.083220 |
+| 3 | 29.793168 | 0.915486 | 0.073793 | 28.771717 | 0.895680 | 0.094080 | 29.073825 | 0.907147 | 0.093101 |
+| 6 | 30.643653 | 0.937910 | 0.045469 | 30.069473 | 0.935751 | 0.043674 | 29.709172 | 0.932309 | 0.050272 |
+| 9 | 28.150730 | 0.885054 | 0.118097 | 27.894215 | 0.879651 | 0.127323 | 27.962790 | 0.887331 | 0.110969 |
+| 12 | 25.589679 | 0.852824 | 0.157653 | 25.571531 | 0.842273 | 0.185470 | 25.590500 | 0.855891 | 0.158546 |
+| 15 | 27.220306 | 0.872145 | 0.091352 | 27.148172 | 0.869773 | 0.097163 | 27.132905 | 0.871853 | 0.091888 |
+| 18 | 32.591092 | 0.930203 | 0.058103 | 32.498791 | 0.927366 | 0.059981 | 32.242477 | 0.926969 | 0.058410 |
+| 21 | 30.613256 | 0.942077 | 0.056233 | 30.232033 | 0.939112 | 0.059006 | 30.291588 | 0.939444 | 0.057215 |
+| 24 | 29.755714 | 0.922825 | 0.070535 | 29.649777 | 0.924063 | 0.069922 | 29.088956 | 0.919698 | 0.074657 |
+| 27 | 29.832127 | 0.911936 | 0.075663 | 30.031648 | 0.913938 | 0.073975 | 29.902362 | 0.911723 | 0.074830 |
+| 30 | 24.433877 | 0.836416 | 0.100061 | 25.006435 | 0.854201 | 0.092820 | 24.355489 | 0.844197 | 0.103387 |
+
+随机600头只在 11 个视频中的 `2/11` 个 PSNR、`3/11` 个 SSIM 和 `4/11` 个 LPIPS
+上优于 Top600 基线；平均 PSNR 低 `0.184052 dB`、SSIM 低 `0.002520`、LPIPS 高
+`0.005853`。在几乎完全相同的平均密度下，该结果支持危险头 risk-sum 排序相较随机选头
+具有稳定的平均质量收益。
+
+等数量随机 token 只在 `2/11` 个 PSNR、`3/11` 个 SSIM 和 `2/11` 个 LPIPS 上优于
+正常 sampled-LSE；平均 PSNR 低 `0.344042 dB`、SSIM 低 `0.001322`、LPIPS 高
+`0.003060`。因此 sampled-LSE 选择的具体 tile 位置优于相同逐行预算下的随机位置，收益
+不是单纯由增加 Residual tile 数量造成的。随机 token 平均慢 `3.407 s`，但时间不是本组
+机制消融的主要结论；基线 prompt 0 的 `218.120 s` 也明显高于同组其他视频约 `206 s`，
+不应将单次时间差解释为稳定加速或减速。
+
+两组消融共 22 条记录均指向正确的 `dense/Step_50-Res_480p`，每条均对齐 129 帧；
+此前错误 720p reference 生成的质量汇总已被覆盖，不应继续引用。

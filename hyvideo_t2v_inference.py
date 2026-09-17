@@ -84,7 +84,16 @@ def parse_args():
     parser.add_argument("--flashinfer64_dense_layer", type=int, default=-1, help="For the topp_topk route only, make the listed heads at this layer fully dense (-1 disables the override).")
     parser.add_argument("--flashinfer64_dense_heads", type=parse_mask_heads, default=(), help="For --flashinfer64_dense_layer, comma-separated heads to run densely, or 'all'.")
     parser.add_argument("--flashinfer64_high_omission_heads_file", type=str, default=None, help="Editable 0-based Layer/Head file for hierarchical Residual checks (default: importanthead/high_omission_heads.txt).")
-    parser.add_argument("--flashinfer64_residual_scorer", choices=["proxy", "sampled_lse"], default="proxy", help="Residual scorer for configured high-omission heads: existing mean proxy or method sampled-LSE.")
+    parser.add_argument(
+        "--flashinfer64_residual_scorer",
+        choices=["proxy", "sampled_lse", "random", "sampled_lse_random"],
+        default="proxy",
+        help=(
+            "Residual selector for configured high-omission heads: mean proxy, "
+            "sampled-LSE, seeded random tiles with proxy-matched counts, or "
+            "seeded random tiles with sampled-LSE-matched counts."
+        ),
+    )
     parser.add_argument("--flashinfer64_residual_temperature", type=float, default=1.0, help="Temperature for the sampled-LSE Residual scorer (default: 1.0).")
     parser.add_argument("--flashinfer64_residual_min_top_k", type=int, default=20, help="Minimum complement K16 tiles retained per risk-head Q16 row.")
     parser.add_argument("--flashinfer64_residual_max_top_k", type=int, default=32, help="Maximum complement K16 tiles retained per risk-head Q16 row.")

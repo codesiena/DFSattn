@@ -313,13 +313,13 @@ indices : 所有被选 K16 block 编号的连续一维数组
 indptr  : 每个 (head,Q16) 行在 indices 中的起止位置
 ```
 
-CUDA 上不再保留原始三维 bool mask，也不再把所有行 padding 到全局最大 Residual 长度。非空 CSR 行按照实际 K16 数量进入 `≤4/8/16/32/64/...` 的 length buckets。
+CUDA 上不再保留原始三维 bool mask，也不再把所有行 padding 到全局最大 Residual 长度。非空 CSR 行按照实际 K16 数量进入 `≤4/8/16/32/64/128/192/256/384/512/...` 的 length buckets。
 
 Triton kernel 的执行方式为：
 
-- 一个 program 对应当前 bucket 中的一个非空 `(head, Q16 block)`；空行不启动 program。
-- program 将该 Q16 block 的 query 载入一次。
-- 循环其 CSR K16 列表，逐块执行 `16×d` 与 `d×16` 的 QK MMA；桶内 padding 有固定小上界，不受全局异常长行影响。
+- `≤64` 的短行仍由一个 program 对应一个非空 `(head, Q16 block)`；空行不启动 program。
+- 从 `≤128` bucket 开始，默认将一行拆成多个 program，每个 program 负责 `64/96/128` 个 K16 slot，分别生成 FP32 partial `(O,LSE)`，随后用分层 LSE merge 合成该行结果。可用 `FLASHINFER64_RESIDUAL_SPLIT_MIN_CAPACITY=0` 关闭拆分做 A/B。
+- 每个 program 将该 Q16 block 的 query 载入一次，并循环自己负责的 CSR K16 片段，逐块执行 `16×d` 与 `d×16` 的 QK MMA；更紧的 `192/384` bucket 同时降低长行尾部 padding。
 - 采用 online softmax，持续更新行最大值、指数和以及 value accumulator。
 - 最终输出 `(O_res, LSE_res)`。
 
@@ -360,6 +360,7 @@ O   = (w_c O_c + w_r O_r) / (w_c + w_r)
 | `FLASHINFER64_PARALLEL_CORE_RESIDUAL` | `False` | CUDA 上让 Core 与 Residual 分别提交到两个 stream；最终 LSE merge 仍在等待两者完成后执行 |
 | `FLASHINFER64_PLAN_WORKSPACE_MB` | `8` | direct 路径每层的 integer scheduler workspace |
 | `FLASHINFER64_CORE_ONLY` | `False` | 消融/测速：只运行 macro Core，跳过 Residual selection、promotion、kernel 和 merge |
+| `FLASHINFER64_RESIDUAL_SPLIT_MIN_CAPACITY` | `128` | 从哪个 bucket 开始把长 Residual 行拆成多个 program；设为 `0` 恢复单 program/行基线 |
 | `FLASHINFER_CSR_EXPAND_CTA_MULTIPLIER` | C++ 为 `1`；DFS wrapper 为 `0` | direct CSR 展开 kernel 的 CTA 数；正整数 `N` 表示 `min(batch_size, N × SM数)`，`0` 表示一行一个 CTA。wrapper 会将实际值写入 FlashInfer output dir |
 
 旧参数 `FLASHINFER64_TOKEN_TOP_RATIO` 和 `FLASHINFER64_TOKEN_TOP_K` 仅为命令兼容保留，当前论文主路径的 Residual 由 `FLASHINFER64_TOKEN_TOP_P` 控制。

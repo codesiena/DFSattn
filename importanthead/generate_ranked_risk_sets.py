@@ -98,7 +98,9 @@ def main() -> None:
         "All 60x24 Layer/Head pairs.",
     )
     rng = np.random.default_rng(args.random_seed)
-    for random_size in (300, 800):
+    # Keep 300 and 800 first so their previously published seeded controls do
+    # not change when adding the N=600 control.
+    for random_size in (300, 800, 600):
         random_ids = rng.choice(60 * 24, size=random_size, replace=False)
         random_pairs = sorted((int(i // 24), int(i % 24)) for i in random_ids)
         write_set(

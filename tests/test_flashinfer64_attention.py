@@ -24,7 +24,10 @@ from dfsattn.flashinfer64_attention import (
     _load_high_omission_heads,
     _merge_lse_active_rows,
     _promote_residual_microtiles,
+    _randomize_residual_support_matched_count,
     _replay_residual_mask,
+    _residual_split_chunk_capacity,
+    _run_residual_micro,
     _select_residual_to_total_mass,
     _select_hyvideo_core_tiles,
     compute_64_tile_scores,
@@ -149,6 +152,21 @@ class FlashInfer64AttentionTest(unittest.TestCase):
             self.assertGreater(int(backend.route.residual_mask[1].sum()), 0)
         finally:
             os.unlink(path)
+
+    def test_randomized_residual_preserves_each_row_count(self) -> None:
+        micro_scores = torch.ones((2, 16, 18))
+        core = torch.zeros((2, 2, 3), dtype=torch.bool)
+        core[:, 0, 0] = True
+        residual = torch.zeros_like(micro_scores, dtype=torch.bool)
+        residual[:, :, 7:10] = True
+        randomized = _randomize_residual_support_matched_count(
+            residual, micro_scores, core, seed=20260917,
+        )
+        torch.testing.assert_close(
+            randomized.sum(-1), residual.sum(-1), atol=0, rtol=0,
+        )
+        self.assertFalse(bool(randomized[:, :8, :6].any()))
+        self.assertFalse(bool(torch.equal(randomized, residual)))
 
     def test_replay_mask_is_core_disjoint(self) -> None:
         micro = torch.zeros((1, 16, 18))
@@ -692,6 +710,65 @@ class FlashInfer64AttentionTest(unittest.TestCase):
         self.assertEqual(stats[1], 0.5)
         self.assertEqual(stats[3], 5.0)
         self.assertAlmostEqual(stats[4], 0.5)
+
+    def test_residual_long_rows_use_tighter_length_buckets(self) -> None:
+        residual = torch.zeros((1, 4, 513), dtype=torch.bool)
+        row_lengths = (129, 193, 257, 385)
+        for row, length in enumerate(row_lengths):
+            residual[0, row, :length] = True
+
+        indices, indptr, buckets, _ = _build_residual_csr(residual)
+
+        self.assertEqual(indptr.tolist(), [0, 129, 322, 579, 964])
+        self.assertEqual(indices.numel(), sum(row_lengths))
+        self.assertEqual(
+            {cap: rows.tolist() for cap, rows in buckets},
+            {192: [0], 256: [1], 384: [2], 512: [3]},
+        )
+
+    def test_residual_long_row_chunk_schedule(self) -> None:
+        self.assertEqual(_residual_split_chunk_capacity(64), 0)
+        self.assertEqual(_residual_split_chunk_capacity(128), 64)
+        self.assertEqual(_residual_split_chunk_capacity(192), 64)
+        self.assertEqual(_residual_split_chunk_capacity(256), 64)
+        self.assertEqual(_residual_split_chunk_capacity(384), 96)
+        self.assertEqual(_residual_split_chunk_capacity(512), 128)
+        self.assertEqual(_residual_split_chunk_capacity(1024), 128)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_split_residual_long_row_matches_unsplit_kernel(self) -> None:
+        torch.manual_seed(37)
+        sequence = 130 * MICRO
+        q = torch.randn((1, sequence, 128), device="cuda", dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        residual = torch.zeros((1, 130, 130), device="cuda", dtype=torch.bool)
+        residual[0, 0, :129] = True
+        indices, indptr, buckets, _ = _build_residual_csr(residual)
+        route = SimpleNamespace(
+            residual_indices=indices,
+            residual_indptr=indptr,
+            residual_buckets=buckets,
+            residual_active_rows=torch.cat(tuple(rows for _, rows in buckets)),
+            residual_mask=None,
+        )
+        old_value = os.environ.get("FLASHINFER64_RESIDUAL_SPLIT_MIN_CAPACITY")
+        try:
+            os.environ["FLASHINFER64_RESIDUAL_SPLIT_MIN_CAPACITY"] = "0"
+            unsplit_out, unsplit_lse = _run_residual_micro(q, k, v, route)
+            os.environ["FLASHINFER64_RESIDUAL_SPLIT_MIN_CAPACITY"] = "128"
+            split_out, split_lse = _run_residual_micro(q, k, v, route)
+        finally:
+            if old_value is None:
+                os.environ.pop("FLASHINFER64_RESIDUAL_SPLIT_MIN_CAPACITY", None)
+            else:
+                os.environ["FLASHINFER64_RESIDUAL_SPLIT_MIN_CAPACITY"] = old_value
+        torch.testing.assert_close(
+            split_out.float(), unsplit_out.float(), atol=1e-3, rtol=1e-3,
+        )
+        torch.testing.assert_close(
+            split_lse, unsplit_lse, atol=3e-6, rtol=1e-6,
+        )
 
     def test_residual_uses_absolute_mass_without_renormalizing_complement(self) -> None:
         # Core covers 0.70 original mass.  A total target of 0.80 requires only
