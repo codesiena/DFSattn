@@ -519,3 +519,144 @@ CUDA、Residual 非空且未启用 `CORE_ONLY` 时生效；CPU 路径或空 Resi
 SM/显存带宽占用，必须比较相同输入下的 `e2e_generation_gpu`、
 `flashinfer_core_run`、Residual 总阶段和 `flashinfer_lse_merge`，不能把两个
 可能重叠的 phase 时间直接相加。
+
+### 7.2 sampled-LSE BF16 GEMM 与 capped residual selection 实验
+
+这两项优化均与旧路径隔离，默认配置不变：
+
+```bash
+# 旧行为（默认）
+FLASHINFER64_SAMPLED_LSE_GEMM_DTYPE=fp32 \
+FLASHINFER64_CAPPED_RESIDUAL_SELECT=False
+
+# 单独开启 sampled-LSE representative GEMM 的 BF16 实验路径
+FLASHINFER64_SAMPLED_LSE_GEMM_DTYPE=bf16
+
+# 单独开启 max_top_k 截断选择实验路径
+FLASHINFER64_CAPPED_RESIDUAL_SELECT=True
+```
+
+BF16 路径只把 sampled-LSE 的 representative Q/K 和 einsum 改为 BF16；einsum
+结果立即转换为 FP32，后续 scale、logsumexp、softmax 和累计仍沿用 FP32。
+`capped residual selection` 在设置了 `max_top_k` 时，用带原始 K index
+tie-break 的 top-k key 代替对整行 K16 的 stable full sort；关闭时完整保留原来的
+`torch.sort(..., stable=True)`。两个选项均进入 route-cache key，避免不同 scorer
+配置复用同一条缓存 route。脚本仅在开启实验值时追加输出目录 tag，因此旧默认
+目录命名也保持不变。
+
+2026-09-17 在空闲 GH200 上对 prompt 0 做单视频暖态对比，其他参数与
+top600 sampled-LSE 主配置一致：
+
+| 配置 | E2E GPU (ms) | attention (ms) | residual select (ms) | peak score (ms) |
+|---|---:|---:|---:|---:|
+| FP32、uncapped、serial 控制组 | 205290.391 | 93246.234 | 10043.248 | 8124.810 |
+| BF16、uncapped、serial | 204545.203 | 92537.467 | 9489.151 | 7573.206 |
+| BF16、capped、serial | 205908.531 | 92814.680 | 9059.170 | 7454.758 |
+
+BF16 scorer 虽然在该单视频中令 E2E 减少 `745.188 ms`（`0.363%`），但
+mean final density 从 `0.1984031460` 变为 `0.1984036878`，说明边界 route
+已经变化。按照后续明确的约束——性能优化不得改变稀疏选择——该结果作废，
+不得作为推荐配置；默认和正式计时必须保持
+`FLASHINFER64_SAMPLED_LSE_GEMM_DTYPE=fp32`。capped selection 单独测试可保持
+支持集一致，但当前没有稳定的 E2E 收益，因此也维持默认关闭。
+
+### 7.3 `max_top_k=32` 的短行细桶与 launch tuning
+
+新增执行专用参数：
+
+```bash
+# 默认空值：完整保留旧桶、4 warps 和 Triton 默认 stages
+FLASHINFER64_RESIDUAL_SHORT_BUCKET_TUNING=''
+
+# 当前实验候选
+FLASHINFER64_RESIDUAL_SHORT_BUCKET_TUNING='20:4:3,24:4:3,28:4:3,32:4:3'
+```
+
+每项格式为 `bucket_capacity:num_warps:num_stages`。只有显式设置时，才将
+`20/24/28` 加入原来的 `4/8/16/32/...` bucket 边界，并覆盖指定桶的 Triton
+launch 参数；空值不会增加新桶，也不会显式设置 `num_stages`。非空配置会写入
+输出目录 tag，并进入 route-cache identity，避免复用采用不同 bucket layout 的
+route。
+
+该参数只作用于 Residual mask 已经选定且 CSR `indices/indptr` 已经构造之后的
+行分桶和 kernel launch，不参与 scorer、Top-k/Top-p、promotion 或 CSR column
+选择。单元测试逐元素确认新旧 `indices/indptr` 相同；完整 prompt 0 A/B 的
+`density_summary.csv` 也逐字节相同。
+
+实际尺寸 kernel sweep 中，`8 warps` 在全部四个短桶上约比 `4 warps` 慢一倍；
+`4 warps / 3 stages` 在 `20/24/28/32` 上均为最快候选。2026-09-17 空闲 GH200
+严格顺序暖态 A/B 结果为：
+
+| 配置 | E2E GPU (ms) | attention (ms) | Residual kernel (ms) | compact (ms) |
+|---|---:|---:|---:|---:|
+| 默认旧桶 | 205509.922 | 93288.011 | 4808.662 | 547.391 |
+| `20/24/28/32`, `4w3s` | 204935.313 | 92842.085 | 4329.068 | 582.684 |
+| 差值 | -574.609 | -445.926 | -479.594 | +35.294 |
+
+Residual kernel 减少 `9.974%`，单视频 E2E 减少 `0.280%`。只增加 `20/32`
+的版本 Residual kernel 为 `4559.625 ms`，比完整细桶慢 `230.557 ms`（与同轮
+完整细桶复测比较），所以当前候选保留四个细桶。由于新桶会产生新的 Triton
+specialization，第一次冷运行不能用于计时；必须先预热再比较。
+
+### 7.4 融合 Q/K/V permutation 与 output unpermute
+
+两个数据搬运优化继续采用默认关闭的独立参数：
+
+```bash
+# 默认旧行为
+FLASHINFER64_FUSED_QKV_PERMUTE_TUNING='' \
+FLASHINFER64_FUSED_OUTPUT_UNPERMUTE_TUNING=''
+
+# 当前候选，格式均为 block_m:num_warps
+FLASHINFER64_FUSED_QKV_PERMUTE_TUNING='8:8' \
+FLASHINFER64_FUSED_OUTPUT_UNPERMUTE_TUNING='16:8'
+```
+
+旧 QKV 路径分别执行三次 PyTorch advanced-index gather，并在每次调用中构造
+inverse permutation。融合路径缓存不变的 Hilbert permutation/inverse，分配一个
+连续 `[3,H,S,D]` buffer，用单个 Triton kernel 同时逐元素复制 Q、K、V。输出路径
+则用另一个单 kernel 按相同 inverse permutation 恢复 token 顺序。两者都只是数据
+搬运，不修改任何数值、scorer、Core mask、promotion 或 Residual CSR。
+
+CUDA 单元测试覆盖 BF16 Q/K/V、BF16 output 和 FP32→BF16 output cast，所有融合
+结果与旧 PyTorch 路径逐 bit 相同。完整 prompt 0 的两组 `density_summary.csv`
+逐字节相同，最终 `0.mp4` 的 SHA256 也完全相同：
+
+```text
+f8502074111a6534a63b536692ebacebfbc1dfa30772b118212189606b614a38
+```
+
+在四细桶 `20/24/28/32, 4w3s` 已开启的共同基线上，当前代码暖态结果为：
+
+| 配置 | E2E GPU (ms) | attention (ms) | QKV permute (ms) | output unpermute (ms) |
+|---|---:|---:|---:|---:|
+| legacy I/O | 204799.641 | 92809.385 | 5064.131 | 2592.539 |
+| fused QKV `8:8` + fused output `16:8` | 200329.344 | 88260.805 | 1746.379 | 1457.303 |
+| 差值 | -4470.297 | -4548.580 | -3317.752 | -1135.236 |
+
+E2E 减少 `2.183%`；QKV permutation 减少 `65.515%`，output unpermute 减少
+`43.789%`。相对同轮默认旧桶控制组 `205509.922 ms`，四细桶加融合 I/O 的累计
+E2E 改善为 `5180.578 ms`（`2.520%`）。新增参数只有非空时才进入输出目录 tag，
+默认旧路径和旧目录命名保持不变。和其他 Triton 新 specialization 一样，源码变化
+后的第一次完整运行可能包含冷编译，正式比较必须使用第二遍暖态结果。
+
+### 7.5 Batched residual selection 实验（功能一致，暂不作为默认推荐）
+
+新增执行专用开关，默认关闭：
+
+```bash
+FLASHINFER64_BATCHED_RESIDUAL_SELECT=False
+```
+
+设置为 `True` 时，risk heads 的 Residual stable sort/cumsum/scatter 一次批量
+执行；sampled-LSE scorer、FP32 计算、Top-p、min/max Top-k 和所有 tie-break
+规则不变。sampled-LSE 返回的连续 risk-head tensor 也直接传入 selector，避免
+再次构造约 300MB 的拼接副本。该开关进入 route-cache key，脚本在默认输出目录
+中追加 `batchedselectTrue`，不会覆盖旧结果。
+
+单元测试在量化 ties、混合 override、capped/uncapped 两种路径下逐 bit 确认
+Residual mask、CSR `indices/indptr` 和 bucket row IDs 一致；480p prompt 0 的
+多次完整运行中 `density_summary.csv` 与最终 MP4 SHA256 也完全一致。真实尺寸
+selector microbenchmark（10 risk heads，Q16/K16=2801）从 `10.226 ms` 降到
+`8.460 ms`（`-17.27%`）。但端到端收益只有约 `0.2 s`，小于当前单视频运行抖动，
+因此正式推荐配置仍保持 `False`；后续应与 risk-head compact CSR 合并优化后再复测。

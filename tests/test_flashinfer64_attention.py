@@ -16,6 +16,7 @@ from dfsattn.flashinfer64_attention import (
     _build_residual_csr,
     _build_residual_csr_from_fine_indices,
     _build_rode_center_csr,
+    _count_route_interactions,
     _ensure_flashinfer_vector_workspace,
     _compute_head_occupancy_tau_stats,
     compute_peak_aware_micro_tile_scores,
@@ -23,13 +24,20 @@ from dfsattn.flashinfer64_attention import (
     _force_dense_heads,
     _load_high_omission_heads,
     _merge_lse_active_rows,
+    _parse_fused_qkv_permute_tuning,
+    _parse_fused_output_unpermute_tuning,
+    _parse_residual_short_bucket_tuning,
+    _permute_qkv,
+    _permute_qkv_fused,
     _promote_residual_microtiles,
     _randomize_residual_support_matched_count,
     _replay_residual_mask,
+    _residual_bucket_caps,
     _residual_split_chunk_capacity,
     _run_residual_micro,
     _select_residual_to_total_mass,
     _select_hyvideo_core_tiles,
+    _unpermute_output_fused,
     compute_64_tile_scores,
     select_64_tiles_from_scores,
     select_fine_topk_from_scores,
@@ -39,6 +47,78 @@ from analyze_macro_topk_error import fixed_macro_topk, macro_structure
 
 
 class FlashInfer64AttentionTest(unittest.TestCase):
+    def test_fused_qkv_permute_tuning_parser_is_isolated(self) -> None:
+        self.assertIsNone(_parse_fused_qkv_permute_tuning(""))
+        self.assertEqual(_parse_fused_qkv_permute_tuning("16:4"), (16, 4))
+        for spec in ("3:4", "16:2", "16", "x:4", "16:4:2"):
+            with self.subTest(spec=spec), self.assertRaises(ValueError):
+                _parse_fused_qkv_permute_tuning(spec)
+
+    def test_fused_output_unpermute_tuning_parser_is_isolated(self) -> None:
+        self.assertIsNone(_parse_fused_output_unpermute_tuning(""))
+        self.assertEqual(_parse_fused_output_unpermute_tuning("8:8"), (8, 8))
+        for spec in ("2:4", "8:2", "8", "x:8", "8:8:2"):
+            with self.subTest(spec=spec), self.assertRaises(ValueError):
+                _parse_fused_output_unpermute_tuning(spec)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_fused_qkv_permute_is_bitwise_equal_to_legacy(self) -> None:
+        torch.manual_seed(40)
+        q = torch.randn((1, 3, 67, 128), device="cuda", dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        video_perm = torch.randperm(61, device="cuda")
+        legacy = _permute_qkv(q, k, v, video_perm, 61)
+        for tuning in ((4, 4), (8, 4), (16, 4), (32, 4), (16, 8)):
+            fused = _permute_qkv_fused(q, k, v, video_perm, 61, tuning)
+            for actual, expected in zip(fused, legacy):
+                self.assertTrue(torch.equal(actual, expected))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_fused_output_unpermute_is_bitwise_equal_to_legacy(self) -> None:
+        torch.manual_seed(41)
+        inverse = torch.randperm(67, device="cuda")
+        for input_dtype, output_dtype in (
+            (torch.bfloat16, torch.bfloat16),
+            (torch.float32, torch.bfloat16),
+        ):
+            main = torch.randn(
+                (3, 67, 128), device="cuda", dtype=input_dtype
+            )
+            expected = main.to(output_dtype)[None, :, inverse]
+            for tuning in ((4, 4), (8, 4), (8, 8), (16, 4), (32, 8)):
+                actual = _unpermute_output_fused(
+                    main, inverse, output_dtype, tuning
+                )
+                self.assertTrue(torch.equal(actual, expected))
+
+    def test_route_interaction_count_handles_partial_edge_tiles(self) -> None:
+        torch.manual_seed(38)
+        sequence = 193
+        q_macro = (sequence + Q_MACRO - 1) // Q_MACRO
+        k_macro = (sequence + K_MACRO - 1) // K_MACRO
+        micro = (sequence + MICRO - 1) // MICRO
+        core = torch.rand((2, q_macro, k_macro)) > 0.5
+        residual = torch.rand((2, micro, micro)) > 0.7
+
+        q_sizes = torch.full((q_macro,), Q_MACRO, dtype=torch.int64)
+        k_sizes = torch.full((k_macro,), K_MACRO, dtype=torch.int64)
+        q_sizes[-1] = sequence - (q_macro - 1) * Q_MACRO
+        k_sizes[-1] = sequence - (k_macro - 1) * K_MACRO
+        q16 = torch.full((micro,), MICRO, dtype=torch.int64)
+        k16 = torch.full((micro,), MICRO, dtype=torch.int64)
+        q16[-1] = sequence - (micro - 1) * MICRO
+        k16[-1] = sequence - (micro - 1) * MICRO
+
+        expected_core = int(
+            (core * q_sizes[None, :, None] * k_sizes[None, None]).sum()
+        )
+        expected_residual = int(
+            (residual * q16[None, :, None] * k16[None, None]).sum()
+        )
+        actual = _count_route_interactions(core, residual, sequence)
+        self.assertEqual(actual, (expected_core, expected_residual, int(residual.sum())))
+
     def test_dynamic_macro_ratio_matches_native_dfsattn_schedule(self) -> None:
         expected = {
             11: (False, 0.30),
@@ -88,6 +168,21 @@ class FlashInfer64AttentionTest(unittest.TestCase):
         torch.testing.assert_close(
             scores.sum(-1), torch.ones_like(scores.sum(-1)), atol=1e-6, rtol=1e-6,
         )
+
+    def test_sampled_lse_bf16_gemm_is_normalized_and_close(self) -> None:
+        torch.manual_seed(40)
+        q = torch.randn(2, 65, 32, dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        fp32 = compute_peak_aware_micro_tile_scores(
+            q, k, q_chunk_size=2, gemm_dtype="fp32",
+        )
+        bf16 = compute_peak_aware_micro_tile_scores(
+            q, k, q_chunk_size=2, gemm_dtype="bf16",
+        )
+        torch.testing.assert_close(
+            bf16.sum(-1), torch.ones_like(bf16.sum(-1)), atol=1e-6, rtol=1e-6,
+        )
+        torch.testing.assert_close(bf16, fp32, atol=5e-4, rtol=5e-3)
 
     def test_topp_topk_residual_check_is_limited_to_configured_heads(self) -> None:
         torch.manual_seed(35)
@@ -735,6 +830,83 @@ class FlashInfer64AttentionTest(unittest.TestCase):
         self.assertEqual(_residual_split_chunk_capacity(512), 128)
         self.assertEqual(_residual_split_chunk_capacity(1024), 128)
 
+    def test_short_bucket_tuning_is_isolated_and_preserves_csr(self) -> None:
+        tuning = _parse_residual_short_bucket_tuning(
+            "20:4:2,24:4:3,28:8:3,32:8:4"
+        )
+        self.assertEqual(
+            tuning,
+            ((20, 4, 2), (24, 4, 3), (28, 8, 3), (32, 8, 4)),
+        )
+        self.assertEqual(_parse_residual_short_bucket_tuning(""), ())
+        self.assertNotIn(20, _residual_bucket_caps(()))
+        self.assertIn(20, _residual_bucket_caps(tuning))
+
+        residual = torch.zeros((1, 8, 40), dtype=torch.bool)
+        row_lengths = (17, 20, 21, 24, 25, 28, 29, 32)
+        for row, length in enumerate(row_lengths):
+            residual[0, row, :length] = True
+        legacy = _build_residual_csr(residual)
+        fine = _build_residual_csr(
+            residual, bucket_caps=_residual_bucket_caps(tuning)
+        )
+        torch.testing.assert_close(fine[0], legacy[0], rtol=0, atol=0)
+        torch.testing.assert_close(fine[1], legacy[1], rtol=0, atol=0)
+        self.assertEqual(
+            {cap: rows.tolist() for cap, rows in fine[2]},
+            {20: [0, 1], 24: [2, 3], 28: [4, 5], 32: [6, 7]},
+        )
+
+    def test_short_bucket_tuning_rejects_invalid_specs(self) -> None:
+        invalid_specs = (
+            "16:4:2", "20:2:2", "20:4:0", "20:4", "20:x:2",
+            "20:4:2,20:8:3",
+        )
+        for spec in invalid_specs:
+            with self.subTest(spec=spec), self.assertRaises(ValueError):
+                _parse_residual_short_bucket_tuning(spec)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_short_bucket_tuned_kernel_matches_legacy_support(self) -> None:
+        torch.manual_seed(39)
+        tuning = _parse_residual_short_bucket_tuning(
+            "20:4:2,24:4:3,28:8:3,32:8:4"
+        )
+        sequence = 40 * MICRO
+        q = torch.randn((1, sequence, 128), device="cuda", dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        residual = torch.zeros((1, 40, 40), device="cuda", dtype=torch.bool)
+        row_lengths = (17, 20, 21, 24, 25, 28, 29, 32)
+        for row, length in enumerate(row_lengths):
+            residual[0, row, :length] = True
+
+        def make_route(bucket_caps=None):
+            indices, indptr, buckets, _ = _build_residual_csr(
+                residual, bucket_caps=bucket_caps
+            )
+            return SimpleNamespace(
+                residual_indices=indices,
+                residual_indptr=indptr,
+                residual_buckets=buckets,
+                residual_active_rows=torch.cat(tuple(rows for _, rows in buckets)),
+                residual_mask=None,
+            )
+
+        legacy_out, legacy_lse = _run_residual_micro(
+            q, k, v, make_route()
+        )
+        tuned_out, tuned_lse = _run_residual_micro(
+            q, k, v, make_route(_residual_bucket_caps(tuning)),
+            short_bucket_tuning=tuning,
+        )
+        torch.testing.assert_close(
+            tuned_out.float(), legacy_out.float(), atol=2e-3, rtol=2e-3,
+        )
+        torch.testing.assert_close(
+            tuned_lse, legacy_lse, atol=2e-5, rtol=2e-6,
+        )
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_split_residual_long_row_matches_unsplit_kernel(self) -> None:
         torch.manual_seed(37)
@@ -801,6 +973,109 @@ class FlashInfer64AttentionTest(unittest.TestCase):
         self.assertTrue(bool((no_floor.sum(-1) == 0).all()))
         self.assertTrue(bool((floor_four.sum(-1) == 4).all()))
         self.assertTrue(bool((capped_two.sum(-1) == 2).all()))
+
+    def test_capped_residual_select_matches_stable_full_sort(self) -> None:
+        torch.manual_seed(38)
+        micro = torch.softmax(torch.randn(2, 16, 80), dim=-1)
+        # Quantization creates exact ties, including around the Top-k boundary.
+        micro = (micro * 128).round() / 128
+        micro /= micro.sum(-1, keepdim=True)
+        core = torch.zeros((2, 2, 14), dtype=torch.bool)
+        core[:, :, (1, 4, 9)] = True
+        common = dict(total_top_p=0.90, min_top_k=20, max_top_k=32)
+        stable = _select_residual_to_total_mass(
+            micro, core, capped_topk=False, **common,
+        )
+        capped = _select_residual_to_total_mass(
+            micro, core, capped_topk=True, **common,
+        )
+        torch.testing.assert_close(capped, stable)
+
+    def test_capped_residual_select_matches_head_override_path(self) -> None:
+        torch.manual_seed(39)
+        micro = torch.softmax(torch.randn(3, 8, 72), dim=-1)
+        override = torch.softmax(torch.randn(1, 8, 72), dim=-1)
+        core = torch.zeros((3, 1, 12), dtype=torch.bool)
+        head_mask = torch.tensor((False, True, False))
+        common = dict(
+            total_top_p=0.90,
+            head_mask=head_mask,
+            min_top_k=20,
+            max_top_k=32,
+            score_overrides={1: override},
+        )
+        stable = _select_residual_to_total_mass(
+            micro, core, capped_topk=False, **common,
+        )
+        capped = _select_residual_to_total_mass(
+            micro, core, capped_topk=True, **common,
+        )
+        torch.testing.assert_close(capped, stable)
+
+    def test_batched_residual_select_matches_per_head_path(self) -> None:
+        torch.manual_seed(42)
+        micro = torch.softmax(torch.randn(5, 16, 84), dim=-1)
+        # Exercise stable tie-breaking and a mixture of overridden and proxy
+        # heads. Risk heads remain in ascending global-head order.
+        micro = (micro * 256).round() / 256
+        micro /= micro.sum(-1, keepdim=True)
+        overrides = {
+            1: torch.softmax(torch.randn(1, 16, 84), dim=-1),
+            4: torch.softmax(torch.randn(1, 16, 84), dim=-1),
+        }
+        core = torch.zeros((5, 2, 14), dtype=torch.bool)
+        core[:, :, (1, 5, 11)] = True
+        head_mask = torch.tensor((False, True, True, False, True))
+        common = dict(
+            total_top_p=0.90,
+            head_mask=head_mask,
+            min_top_k=20,
+            max_top_k=32,
+            score_overrides=overrides,
+        )
+        for capped_topk in (False, True):
+            with self.subTest(capped_topk=capped_topk):
+                legacy = _select_residual_to_total_mass(
+                    micro, core, capped_topk=capped_topk,
+                    batched_heads=False, **common,
+                )
+                batched = _select_residual_to_total_mass(
+                    micro, core, capped_topk=capped_topk,
+                    batched_heads=True, **common,
+                )
+                self.assertTrue(torch.equal(batched, legacy))
+                legacy_csr = _build_residual_csr(legacy)
+                batched_csr = _build_residual_csr(batched)
+                self.assertTrue(torch.equal(batched_csr[0], legacy_csr[0]))
+                self.assertTrue(torch.equal(batched_csr[1], legacy_csr[1]))
+                self.assertEqual(
+                    tuple(cap for cap, _ in batched_csr[2]),
+                    tuple(cap for cap, _ in legacy_csr[2]),
+                )
+                for (_, actual_rows), (_, expected_rows) in zip(
+                    batched_csr[2], legacy_csr[2]
+                ):
+                    self.assertTrue(torch.equal(actual_rows, expected_rows))
+
+        selected_heads = torch.nonzero(head_mask).flatten().tolist()
+        contiguous_overrides = torch.cat(tuple(
+            overrides.get(head, micro[head:head + 1])
+            for head in selected_heads
+        ), dim=0)
+        direct_batched = _select_residual_to_total_mass(
+            micro, core,
+            total_top_p=common["total_top_p"],
+            head_mask=head_mask,
+            min_top_k=common["min_top_k"],
+            max_top_k=common["max_top_k"],
+            batched_score_overrides=contiguous_overrides,
+            batched_heads=True,
+        )
+        legacy = _select_residual_to_total_mass(
+            micro, core, capped_topk=False,
+            batched_heads=False, **common,
+        )
+        self.assertTrue(torch.equal(direct_batched, legacy))
 
     def test_cpu_fallback_reuses_route_but_rebuilds_reference_plan(self) -> None:
         torch.manual_seed(9)

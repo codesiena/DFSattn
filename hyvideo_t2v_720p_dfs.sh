@@ -45,9 +45,21 @@ flashinfer64_direct_macro_csr="${FLASHINFER64_DIRECT_MACRO_CSR:-True}"
 flashinfer64_residual_backend="${FLASHINFER64_RESIDUAL_BACKEND:-micro}"
 flashinfer64_rode_cache="${FLASHINFER64_RODE_CACHE:-False}"
 flashinfer64_parallel_core_residual="${FLASHINFER64_PARALLEL_CORE_RESIDUAL:-False}"
+flashinfer64_capped_residual_select="${FLASHINFER64_CAPPED_RESIDUAL_SELECT:-False}"
+flashinfer64_batched_residual_select="${FLASHINFER64_BATCHED_RESIDUAL_SELECT:-False}"
+flashinfer64_sampled_lse_gemm_dtype="${FLASHINFER64_SAMPLED_LSE_GEMM_DTYPE:-fp32}"
+flashinfer64_residual_short_bucket_tuning="${FLASHINFER64_RESIDUAL_SHORT_BUCKET_TUNING:-}"
+flashinfer64_fused_qkv_permute_tuning="${FLASHINFER64_FUSED_QKV_PERMUTE_TUNING:-}"
+flashinfer64_fused_output_unpermute_tuning="${FLASHINFER64_FUSED_OUTPUT_UNPERMUTE_TUNING:-}"
 export FLASHINFER64_RESIDUAL_BACKEND="$flashinfer64_residual_backend"
 export FLASHINFER64_RODE_CACHE="$flashinfer64_rode_cache"
 export FLASHINFER64_PARALLEL_CORE_RESIDUAL="$flashinfer64_parallel_core_residual"
+export FLASHINFER64_CAPPED_RESIDUAL_SELECT="$flashinfer64_capped_residual_select"
+export FLASHINFER64_BATCHED_RESIDUAL_SELECT="$flashinfer64_batched_residual_select"
+export FLASHINFER64_SAMPLED_LSE_GEMM_DTYPE="$flashinfer64_sampled_lse_gemm_dtype"
+export FLASHINFER64_RESIDUAL_SHORT_BUCKET_TUNING="$flashinfer64_residual_short_bucket_tuning"
+export FLASHINFER64_FUSED_QKV_PERMUTE_TUNING="$flashinfer64_fused_qkv_permute_tuning"
+export FLASHINFER64_FUSED_OUTPUT_UNPERMUTE_TUNING="$flashinfer64_fused_output_unpermute_tuning"
 # The current best direct-CSR schedule is one CTA per CSR row.  Set this in
 # the wrapper (and export it) so the effective value is reproducible even when
 # the caller does not specify the variable explicitly.
@@ -119,6 +131,28 @@ if [ "$sparse_execution" = "flashinfer64" ]; then
     fi
     if [ "$flashinfer64_dense_layer" -ge 0 ] 2>/dev/null && [ -n "$flashinfer64_dense_heads" ]; then
         flashinfer64_route_tag="${flashinfer64_route_tag}_denseL${flashinfer64_dense_layer}H${flashinfer64_dense_heads//,/x}"
+    fi
+    if [ "$flashinfer64_capped_residual_select" = "True" ] || [ "$flashinfer64_capped_residual_select" = "true" ]; then
+        flashinfer64_route_tag="${flashinfer64_route_tag}_cappedselectTrue"
+    fi
+    if [ "$flashinfer64_batched_residual_select" = "True" ] || [ "$flashinfer64_batched_residual_select" = "true" ]; then
+        flashinfer64_route_tag="${flashinfer64_route_tag}_batchedselectTrue"
+    fi
+    if [ "$flashinfer64_sampled_lse_gemm_dtype" != "fp32" ]; then
+        flashinfer64_route_tag="${flashinfer64_route_tag}_sampledlsegemm${flashinfer64_sampled_lse_gemm_dtype}"
+    fi
+    if [ -n "$flashinfer64_residual_short_bucket_tuning" ]; then
+        flashinfer64_bucket_tag="${flashinfer64_residual_short_bucket_tuning//:/-}"
+        flashinfer64_bucket_tag="${flashinfer64_bucket_tag//,/x}"
+        flashinfer64_route_tag="${flashinfer64_route_tag}_shortbuckets${flashinfer64_bucket_tag}"
+    fi
+    if [ -n "$flashinfer64_fused_qkv_permute_tuning" ]; then
+        flashinfer64_permute_tag="${flashinfer64_fused_qkv_permute_tuning//:/-}"
+        flashinfer64_route_tag="${flashinfer64_route_tag}_fusedqkvperm${flashinfer64_permute_tag}"
+    fi
+    if [ -n "$flashinfer64_fused_output_unpermute_tuning" ]; then
+        flashinfer64_output_tag="${flashinfer64_fused_output_unpermute_tuning//:/-}"
+        flashinfer64_route_tag="${flashinfer64_route_tag}_fusedoutperm${flashinfer64_output_tag}"
     fi
     default_output_dir="${res_root}/flashinfer64/${dataset_name}/${model_name}/seed${seed}_${flashinfer64_route_tag}_resbackend${flashinfer64_residual_backend}_rodecache${flashinfer64_rode_cache}_parallel${flashinfer64_parallel_core_residual}_${order}_${height}_routecache${flashinfer64_route_cache}_coreonly${flashinfer64_core_only}_directcsr${flashinfer64_direct_macro_csr}_ctamul${flashinfer_csr_expand_cta_multiplier}_cache${cache_interval}"
     if [ -n "${OUTPUT_DIR:-}" ]; then

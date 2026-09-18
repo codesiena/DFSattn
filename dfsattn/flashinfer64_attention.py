@@ -79,6 +79,8 @@ _shared_core_workspace: Optional[torch.Tensor] = None
 _shared_core_signature = None
 _shared_direct_vector_indices: Optional[torch.Tensor] = None
 _shared_direct_pin_workspace: Optional[torch.Tensor] = None
+_shared_permutation_cache_key = None
+_shared_permutation_cache = None
 _replay_mask_cache: dict[str, tuple[float, dict[str, list[list[int]]]]] = {}
 _high_omission_heads_cache: dict[
     str, tuple[tuple[int, int], dict[int, tuple[int, ...]]]
@@ -88,6 +90,101 @@ _HIGH_OMISSION_HEAD_LINE = re.compile(
     r"^\s*Layer\s*(\d+)\s*/\s*Head\s*(\d+)\s*(?:#.*)?$",
     re.IGNORECASE,
 )
+
+
+def _parse_residual_short_bucket_tuning(spec: str):
+    """Parse isolated short-bucket launch tuning.
+
+    The empty string is the legacy path: no extra bucket boundaries, four
+    warps, and Triton's default stage count. Experimental entries use
+    ``capacity:num_warps:num_stages`` and are intentionally restricted to the
+    20/24/28/32 region targeted by max_top_k=32 workloads.
+    """
+    text = spec.strip()
+    if not text:
+        return ()
+    allowed_caps = {20, 24, 28, 32}
+    parsed = {}
+    for raw_entry in text.split(","):
+        fields = raw_entry.strip().split(":")
+        if len(fields) != 3:
+            raise ValueError(
+                "FLASHINFER64_RESIDUAL_SHORT_BUCKET_TUNING entries must be "
+                "capacity:num_warps:num_stages"
+            )
+        try:
+            capacity, num_warps, num_stages = map(int, fields)
+        except ValueError as exc:
+            raise ValueError(
+                "FLASHINFER64_RESIDUAL_SHORT_BUCKET_TUNING entries must be integers"
+            ) from exc
+        if capacity not in allowed_caps:
+            raise ValueError(
+                "short residual bucket capacity must be one of 20, 24, 28, 32"
+            )
+        if num_warps not in (4, 8):
+            raise ValueError("short residual bucket num_warps must be 4 or 8")
+        if num_stages not in (1, 2, 3, 4, 5):
+            raise ValueError("short residual bucket num_stages must be in [1, 5]")
+        if capacity in parsed:
+            raise ValueError(f"duplicate short residual bucket capacity {capacity}")
+        parsed[capacity] = (num_warps, num_stages)
+    return tuple(
+        (capacity, *parsed[capacity]) for capacity in sorted(parsed)
+    )
+
+
+def _residual_bucket_caps(short_bucket_tuning=()):
+    return tuple(sorted({
+        *RESIDUAL_BUCKET_CAPS,
+        *(item[0] for item in short_bucket_tuning),
+    }))
+
+
+def _parse_fused_qkv_permute_tuning(spec: str):
+    """Return ``(block_m, num_warps)`` or ``None`` for the legacy path."""
+    text = spec.strip()
+    if not text:
+        return None
+    fields = text.split(":")
+    if len(fields) != 2:
+        raise ValueError(
+            "FLASHINFER64_FUSED_QKV_PERMUTE_TUNING must be block_m:num_warps"
+        )
+    try:
+        block_m, num_warps = map(int, fields)
+    except ValueError as exc:
+        raise ValueError(
+            "FLASHINFER64_FUSED_QKV_PERMUTE_TUNING values must be integers"
+        ) from exc
+    if block_m not in (4, 8, 16, 32):
+        raise ValueError("fused QKV permutation block_m must be 4, 8, 16, or 32")
+    if num_warps not in (4, 8):
+        raise ValueError("fused QKV permutation num_warps must be 4 or 8")
+    return block_m, num_warps
+
+
+def _parse_fused_output_unpermute_tuning(spec: str):
+    """Return ``(block_m, num_warps)`` or ``None`` for legacy output gather."""
+    text = spec.strip()
+    if not text:
+        return None
+    fields = text.split(":")
+    if len(fields) != 2:
+        raise ValueError(
+            "FLASHINFER64_FUSED_OUTPUT_UNPERMUTE_TUNING must be block_m:num_warps"
+        )
+    try:
+        block_m, num_warps = map(int, fields)
+    except ValueError as exc:
+        raise ValueError(
+            "FLASHINFER64_FUSED_OUTPUT_UNPERMUTE_TUNING values must be integers"
+        ) from exc
+    if block_m not in (4, 8, 16, 32):
+        raise ValueError("fused output unpermute block_m must be 4, 8, 16, or 32")
+    if num_warps not in (4, 8):
+        raise ValueError("fused output unpermute num_warps must be 4 or 8")
+    return block_m, num_warps
 
 
 def _default_high_omission_heads_file() -> str:
@@ -295,6 +392,81 @@ def _permute_qkv(q, k, v, video_perm, video_len):
     return q[0, :, perm].contiguous(), k[0, :, perm].contiguous(), v[0, :, perm].contiguous(), inverse
 
 
+def _cached_permutation(sequence, video_perm, video_len, device):
+    """Cache the immutable Hilbert permutation only for the fused copy path."""
+    global _shared_permutation_cache_key, _shared_permutation_cache
+    if video_perm is None:
+        source_key = None
+    else:
+        source_key = (
+            video_perm.device,
+            int(video_perm.data_ptr()),
+            int(getattr(video_perm, "_version", 0)),
+            int(video_perm.numel()),
+        )
+    key = (int(sequence), -1 if video_len is None else int(video_len), device, source_key)
+    if _shared_permutation_cache_key != key or _shared_permutation_cache is None:
+        _shared_permutation_cache = _make_permutation(
+            sequence, video_perm, video_len, device
+        )
+        _shared_permutation_cache_key = key
+    return _shared_permutation_cache
+
+
+def _permute_qkv_fused(q, k, v, video_perm, video_len, tuning):
+    """Byte-preserving Q/K/V gather using one Triton launch."""
+    if triton is None or not q.is_cuda:
+        return _permute_qkv(q, k, v, video_perm, video_len)
+    if q.ndim != 4 or q.shape != k.shape or q.shape != v.shape or q.shape[0] != 1:
+        raise ValueError("q, k, v must match [1, heads, sequence, head_dim]")
+    block_m, num_warps = tuning
+    heads, sequence, dim = q.shape[1:]
+    perm, inverse = _cached_permutation(
+        sequence, video_perm, video_len, q.device
+    )
+    packed = torch.empty(
+        (3, heads, sequence, dim), dtype=q.dtype, device=q.device
+    )
+    q_out, k_out, v_out = packed.unbind(0)
+    _fused_qkv_permute_kernel[(triton.cdiv(sequence, block_m), heads)](
+        q, k, v, perm, q_out, k_out, v_out,
+        sequence,
+        q.stride(1), q.stride(2),
+        k.stride(1), k.stride(2),
+        v.stride(1), v.stride(2),
+        q_out.stride(0), q_out.stride(1),
+        head_dim=dim,
+        block_d=triton.next_power_of_2(dim),
+        block_m=block_m,
+        num_warps=num_warps,
+    )
+    return q_out, k_out, v_out, inverse
+
+
+def _unpermute_output_fused(main, inverse, output_dtype, tuning):
+    """Gather output back to original token order with one Triton kernel."""
+    if triton is None or not main.is_cuda:
+        return main.to(output_dtype)[None, :, inverse]
+    if main.ndim != 3 or inverse.ndim != 1 or inverse.numel() != main.shape[1]:
+        raise ValueError("main must be [heads, sequence, dim] with matching inverse")
+    block_m, num_warps = tuning
+    heads, sequence, dim = main.shape
+    output = torch.empty(
+        (1, heads, sequence, dim), dtype=output_dtype, device=main.device
+    )
+    _fused_output_unpermute_kernel[(triton.cdiv(sequence, block_m), heads)](
+        main, inverse, output,
+        sequence,
+        main.stride(0), main.stride(1),
+        output.stride(1), output.stride(2),
+        head_dim=dim,
+        block_d=triton.next_power_of_2(dim),
+        block_m=block_m,
+        num_warps=num_warps,
+    )
+    return output
+
+
 def _block_means(x: torch.Tensor, block: int) -> torch.Tensor:
     heads, sequence, dim = x.shape
     padded = _ceil_div(sequence, block) * block
@@ -345,6 +517,7 @@ def compute_peak_aware_micro_tile_scores(
     *,
     temperature: float = 1.0,
     q_chunk_size: int = 128,
+    gemm_dtype: str = "fp32",
 ) -> torch.Tensor:
     """Sampled-LSE Q16/K16 probability mass from the method specification.
 
@@ -360,6 +533,8 @@ def compute_peak_aware_micro_tile_scores(
         raise ValueError("temperature must be positive")
     if q_chunk_size < 1:
         raise ValueError("q_chunk_size must be positive")
+    if gemm_dtype not in ("fp32", "bf16"):
+        raise ValueError("gemm_dtype must be 'fp32' or 'bf16'")
     q_representatives = _block_representatives(q)
     k_representatives = _block_representatives(k)
     heads, q_blocks, representative_count, dim = q_representatives.shape
@@ -367,12 +542,15 @@ def compute_peak_aware_micro_tile_scores(
     scale = dim ** -0.5
     log_representative_count = math.log(representative_count * representative_count)
     scores = []
-    k_representatives = k_representatives.float()
+    compute_dtype = torch.float32 if gemm_dtype == "fp32" else torch.bfloat16
+    k_representatives = k_representatives.to(compute_dtype)
     for q_start in range(0, q_blocks, q_chunk_size):
-        q_chunk = q_representatives[:, q_start:q_start + q_chunk_size].float()
+        q_chunk = q_representatives[:, q_start:q_start + q_chunk_size].to(
+            compute_dtype
+        )
         logits = torch.einsum(
             "hqad,hkbd->hqkab", q_chunk, k_representatives
-        ) * scale
+        ).float().mul_(scale)
         logits = logits.reshape(
             heads, q_chunk.shape[1], k_blocks, representative_count * representative_count
         )
@@ -798,6 +976,9 @@ def _select_residual_to_total_mass(
     min_top_k: int = 0,
     max_top_k: Optional[int] = None,
     score_overrides: Optional[Dict[int, torch.Tensor]] = None,
+    batched_score_overrides: Optional[torch.Tensor] = None,
+    capped_topk: bool = False,
+    batched_heads: bool = False,
 ):
     """Select rejected microtiles until Core+Residual reaches total Top-p.
 
@@ -817,9 +998,43 @@ def _select_residual_to_total_mass(
     if head_mask is not None:
         if head_mask.ndim != 1 or head_mask.shape[0] != micro_scores.shape[0]:
             raise ValueError("head_mask must have shape [heads]")
-        selected_heads = torch.nonzero(head_mask, as_tuple=False).flatten().tolist()
+        selected_head_ids = torch.nonzero(
+            head_mask, as_tuple=False
+        ).flatten()
         residual = torch.zeros_like(micro_scores, dtype=torch.bool)
-        for head in selected_heads:
+        if batched_heads and selected_head_ids.numel():
+            selected_heads = selected_head_ids.tolist()
+            if batched_score_overrides is not None:
+                selected_scores = batched_score_overrides
+            elif score_overrides is None:
+                selected_scores = micro_scores.index_select(0, selected_head_ids)
+            else:
+                selected_scores = torch.cat(tuple(
+                    score_overrides.get(
+                        head, micro_scores[head:head + 1]
+                    )
+                    for head in selected_heads
+                ), dim=0)
+            expected_shape = (
+                len(selected_heads), *micro_scores.shape[1:]
+            )
+            if selected_scores.shape != expected_shape:
+                raise ValueError(
+                    "batched score overrides have shape "
+                    f"{tuple(selected_scores.shape)}, expected "
+                    f"{expected_shape}"
+                )
+            selected_residual = _select_residual_to_total_mass(
+                selected_scores,
+                core_mask.index_select(0, selected_head_ids),
+                total_top_p=total_top_p,
+                min_top_k=min_top_k,
+                max_top_k=max_top_k,
+                capped_topk=capped_topk,
+            )
+            residual.index_copy_(0, selected_head_ids, selected_residual)
+            return residual
+        for head in selected_head_ids.tolist():
             head_scores = micro_scores[head:head + 1]
             if score_overrides is not None and head in score_overrides:
                 head_scores = score_overrides[head]
@@ -835,6 +1050,7 @@ def _select_residual_to_total_mass(
                 total_top_p=total_top_p,
                 min_top_k=min_top_k,
                 max_top_k=max_top_k,
+                capped_topk=capped_topk,
             )
         return residual
     q_parent = torch.arange(q_micro, device=micro_scores.device) // Q_MICROS_PER_MACRO
@@ -843,7 +1059,28 @@ def _select_residual_to_total_mass(
     core_mass = micro_scores.masked_fill(~covered_by_core, 0.0).sum(-1)
     required_mass = (total_top_p - core_mass).clamp_min(0.0)
     rejected_mass = micro_scores.masked_fill(covered_by_core, 0.0)
-    values, indices = torch.sort(rejected_mass, dim=-1, descending=True, stable=True)
+    if (
+        capped_topk
+        and max_top_k is not None
+        and 0 < max_top_k < k_micro
+        and rejected_mass.dtype == torch.float32
+    ):
+        # Positive float32 bit patterns preserve numeric ordering.  Folding the
+        # inverse K index into an int64 key reproduces stable descending sort's
+        # tie-break (smaller original K index first) without sorting all K16s.
+        score_bits = rejected_mass.contiguous().view(torch.int32).to(torch.int64)
+        key_indices = torch.arange(
+            k_micro, device=rejected_mass.device, dtype=torch.int64,
+        )
+        stable_keys = score_bits * (k_micro + 1) + (k_micro - key_indices)
+        _, indices = torch.topk(
+            stable_keys, k=max_top_k, dim=-1, largest=True, sorted=True,
+        )
+        values = rejected_mass.gather(-1, indices)
+    else:
+        values, indices = torch.sort(
+            rejected_mass, dim=-1, descending=True, stable=True,
+        )
     keep_by_mass = (
         ((torch.cumsum(values, -1) - values) < required_mass[..., None])
         & (required_mass[..., None] > 0)
@@ -854,7 +1091,7 @@ def _select_residual_to_total_mass(
         target_count = selected_count.clamp_min(min_top_k)
         if max_top_k is not None:
             target_count = target_count.clamp_max(max_top_k)
-        rank = torch.arange(k_micro, device=micro_scores.device)
+        rank = torch.arange(values.shape[-1], device=micro_scores.device)
         keep = (rank < target_count[..., None]) & (values > 0)
     else:
         keep = keep_by_mass
@@ -913,7 +1150,9 @@ def _promote_residual_microtiles(residual, core_mask, *, promotion_threshold):
     return core_mask, residual, promoted_tiles
 
 
-def _build_residual_csr(residual, *, collect_stats: bool = True):
+def _build_residual_csr(
+    residual, *, collect_stats: bool = True, bucket_caps=None,
+):
     """Pack Q16/K16 support into CSR and group non-empty rows by length.
 
     The old layout padded every row to the global maximum selected-K16 count.
@@ -931,7 +1170,9 @@ def _build_residual_csr(residual, *, collect_stats: bool = True):
     key_ids = torch.arange(k_micro, device=residual.device, dtype=torch.int32)
     indices = key_ids.expand(flat.shape[0], -1).masked_select(flat).contiguous()
 
-    caps = list(RESIDUAL_BUCKET_CAPS)
+    caps = list(RESIDUAL_BUCKET_CAPS if bucket_caps is None else bucket_caps)
+    if not caps or caps != sorted(set(caps)) or caps[0] < 1:
+        raise ValueError("residual bucket capacities must be sorted unique positives")
     while caps[-1] < k_micro:
         caps.append(caps[-1] * 2)
     all_rows = torch.arange(counts.numel(), device=residual.device, dtype=torch.int32)
@@ -959,31 +1200,55 @@ def _build_residual_csr(residual, *, collect_stats: bool = True):
 
 def _count_route_interactions(core_mask, residual_mask, sequence):
     """Count valid token interactions once, before the CUDA bool mask dies."""
-    q_sizes = torch.full(
-        (core_mask.shape[1],), Q_MACRO, device=core_mask.device, dtype=torch.int64
-    )
-    k_sizes = torch.full(
-        (core_mask.shape[2],), K_MACRO, device=core_mask.device, dtype=torch.int64
-    )
-    q_sizes[-1] = sequence - (q_sizes.numel() - 1) * Q_MACRO
-    k_sizes[-1] = sequence - (k_sizes.numel() - 1) * K_MACRO
-    core_n = int(
-        (core_mask * q_sizes[None, :, None] * k_sizes[None, None]).sum().item()
-    )
+    # Almost every tile contributes the full QxK area.  Correct only the last
+    # partial row/column instead of materializing a mask-sized int64 product;
+    # at 720p the latter can require roughly 10 GiB for the Residual mask.
+    q_last = sequence - (core_mask.shape[1] - 1) * Q_MACRO
+    k_last = sequence - (core_mask.shape[2] - 1) * K_MACRO
+    core_n = int(core_mask.sum().item()) * Q_MACRO * K_MACRO
+    if q_last != Q_MACRO:
+        core_n -= (
+            int(core_mask[:, -1, :].sum().item())
+            * (Q_MACRO - q_last)
+            * K_MACRO
+        )
+    if k_last != K_MACRO:
+        core_n -= (
+            int(core_mask[:, :, -1].sum().item())
+            * Q_MACRO
+            * (K_MACRO - k_last)
+        )
+    if q_last != Q_MACRO and k_last != K_MACRO:
+        core_n += (
+            int(core_mask[:, -1, -1].sum().item())
+            * (Q_MACRO - q_last)
+            * (K_MACRO - k_last)
+        )
     if residual_mask is None:
         return core_n, 0, 0
-    q16 = torch.full(
-        (residual_mask.shape[1],), MICRO, device=core_mask.device, dtype=torch.int64
-    )
-    k16 = torch.full(
-        (residual_mask.shape[2],), MICRO, device=core_mask.device, dtype=torch.int64
-    )
-    q16[-1] = sequence - (q16.numel() - 1) * MICRO
-    k16[-1] = sequence - (k16.numel() - 1) * MICRO
-    residual_n = int(
-        (residual_mask * q16[None, :, None] * k16[None, None]).sum().item()
-    )
-    return core_n, residual_n, int(residual_mask.sum().item())
+    q16_last = sequence - (residual_mask.shape[1] - 1) * MICRO
+    k16_last = sequence - (residual_mask.shape[2] - 1) * MICRO
+    residual_tiles = int(residual_mask.sum().item())
+    residual_n = residual_tiles * MICRO * MICRO
+    if q16_last != MICRO:
+        residual_n -= (
+            int(residual_mask[:, -1, :].sum().item())
+            * (MICRO - q16_last)
+            * MICRO
+        )
+    if k16_last != MICRO:
+        residual_n -= (
+            int(residual_mask[:, :, -1].sum().item())
+            * MICRO
+            * (MICRO - k16_last)
+        )
+    if q16_last != MICRO and k16_last != MICRO:
+        residual_n += (
+            int(residual_mask[:, -1, -1].sum().item())
+            * (MICRO - q16_last)
+            * (MICRO - k16_last)
+        )
+    return core_n, residual_n, residual_tiles
 
 
 def _count_residual_csr_interactions(
@@ -1345,6 +1610,64 @@ class _DirectMacroCSRPlan:
 
 
 if triton is not None:
+    @triton.jit
+    def _fused_qkv_permute_kernel(
+        q_ptr, k_ptr, v_ptr, perm_ptr,
+        q_out_ptr, k_out_ptr, v_out_ptr,
+        sequence,
+        stride_qh, stride_qs, stride_kh, stride_ks, stride_vh, stride_vs,
+        stride_oh, stride_os,
+        head_dim: tl.constexpr, block_d: tl.constexpr, block_m: tl.constexpr,
+    ):
+        """Gather Q/K/V with the same permutation in one byte-preserving kernel."""
+        block = tl.program_id(0)
+        head = tl.program_id(1)
+        rows = block * block_m + tl.arange(0, block_m)
+        dims = tl.arange(0, block_d)
+        valid = (rows[:, None] < sequence) & (dims[None, :] < head_dim)
+        source_rows = tl.load(
+            perm_ptr + rows, mask=rows < sequence, other=0,
+        )
+        output_offsets = (
+            head * stride_oh + rows[:, None] * stride_os + dims[None, :]
+        )
+        q_offsets = (
+            head * stride_qh + source_rows[:, None] * stride_qs + dims[None, :]
+        )
+        k_offsets = (
+            head * stride_kh + source_rows[:, None] * stride_ks + dims[None, :]
+        )
+        v_offsets = (
+            head * stride_vh + source_rows[:, None] * stride_vs + dims[None, :]
+        )
+        tl.store(q_out_ptr + output_offsets, tl.load(q_ptr + q_offsets, mask=valid), mask=valid)
+        tl.store(k_out_ptr + output_offsets, tl.load(k_ptr + k_offsets, mask=valid), mask=valid)
+        tl.store(v_out_ptr + output_offsets, tl.load(v_ptr + v_offsets, mask=valid), mask=valid)
+
+    @triton.jit
+    def _fused_output_unpermute_kernel(
+        input_ptr, inverse_ptr, output_ptr, sequence,
+        stride_ih, stride_is, stride_oh, stride_os,
+        head_dim: tl.constexpr, block_d: tl.constexpr, block_m: tl.constexpr,
+    ):
+        """Restore original token order with a byte-preserving gather."""
+        block = tl.program_id(0)
+        head = tl.program_id(1)
+        rows = block * block_m + tl.arange(0, block_m)
+        dims = tl.arange(0, block_d)
+        valid = (rows[:, None] < sequence) & (dims[None, :] < head_dim)
+        source_rows = tl.load(
+            inverse_ptr + rows, mask=rows < sequence, other=0,
+        )
+        input_offsets = (
+            head * stride_ih + source_rows[:, None] * stride_is + dims[None, :]
+        )
+        output_offsets = (
+            head * stride_oh + rows[:, None] * stride_os + dims[None, :]
+        )
+        values = tl.load(input_ptr + input_offsets, mask=valid, other=0.0)
+        tl.store(output_ptr + output_offsets, values, mask=valid)
+
     @triton.jit
     def _residual_micro_attention_kernel(
         q_ptr, k_ptr, v_ptr, index_ptr, indptr_ptr, row_ids_ptr, out_ptr, lse_ptr,
@@ -1738,7 +2061,10 @@ def _merge_lse_center_rows(
     return core_output
 
 
-def _run_residual_micro(q, k, v, route, recorder=None, step=-1, layer=-1):
+def _run_residual_micro(
+    q, k, v, route, recorder=None, step=-1, layer=-1,
+    short_bucket_tuning=(),
+):
     heads, sequence, dim = q.shape
     indices = route.residual_indices
     if indices.numel() == 0:
@@ -1774,6 +2100,10 @@ def _run_residual_micro(q, k, v, route, recorder=None, step=-1, layer=-1):
             "FLASHINFER64_RESIDUAL_SPLIT_MIN_CAPACITY must be non-negative"
         )
     active_offset = 0
+    short_launches = {
+        capacity: (num_warps, num_stages)
+        for capacity, num_warps, num_stages in short_bucket_tuning
+    }
     for bucket_capacity, row_ids in route.residual_buckets:
         bucket_start = _timing_start(recorder, q.device)
         chunk_capacity = _residual_split_chunk_capacity(bucket_capacity)
@@ -1782,6 +2112,10 @@ def _run_residual_micro(q, k, v, route, recorder=None, step=-1, layer=-1):
             and bucket_capacity >= split_min_capacity
             and chunk_capacity > 0
         )
+        num_warps, num_stages = short_launches.get(bucket_capacity, (4, None))
+        launch_kwargs = {"num_warps": num_warps}
+        if num_stages is not None:
+            launch_kwargs["num_stages"] = num_stages
         if split_bucket:
             bucket_rows = row_ids.numel()
             num_chunks = _ceil_div(bucket_capacity, chunk_capacity)
@@ -1806,7 +2140,7 @@ def _run_residual_micro(q, k, v, route, recorder=None, step=-1, layer=-1):
                 head_dim=dim, block_d=triton.next_power_of_2(dim),
                 bucket_capacity=bucket_capacity,
                 chunk_capacity=chunk_capacity, num_chunks=num_chunks,
-                micro_size=MICRO, scale=dim ** -0.5, num_warps=4,
+                micro_size=MICRO, scale=dim ** -0.5, **launch_kwargs,
             )
             bucket_output = output.narrow(0, active_offset, bucket_rows)
             bucket_lse = lse.narrow(0, active_offset, bucket_rows)
@@ -1816,7 +2150,7 @@ def _run_residual_micro(q, k, v, route, recorder=None, step=-1, layer=-1):
                 partial_output.stride(2), bucket_output.stride(0),
                 bucket_output.stride(1),
                 head_dim=dim, block_d=triton.next_power_of_2(dim),
-                num_chunks=num_chunks, micro_size=MICRO, num_warps=4,
+                num_chunks=num_chunks, micro_size=MICRO, **launch_kwargs,
             )
         else:
             _residual_micro_attention_kernel[(row_ids.numel(),)](
@@ -1826,7 +2160,7 @@ def _run_residual_micro(q, k, v, route, recorder=None, step=-1, layer=-1):
                 v.stride(0), v.stride(1), output.stride(0), output.stride(1),
                 head_dim=dim, block_d=triton.next_power_of_2(dim),
                 bucket_capacity=bucket_capacity, micro_size=MICRO,
-                scale=dim ** -0.5, num_warps=4,
+                scale=dim ** -0.5, **launch_kwargs,
             )
         _timing_stop(
             recorder, bucket_start,
@@ -2029,6 +2363,29 @@ class FlashInfer64Attention:
             raise ValueError("residual Top-k bounds must be non-negative")
         if residual_min_top_k > residual_max_top_k:
             raise ValueError("residual_min_top_k cannot exceed residual_max_top_k")
+        capped_residual_select = os.environ.get(
+            "FLASHINFER64_CAPPED_RESIDUAL_SELECT", "False"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        batched_residual_select = os.environ.get(
+            "FLASHINFER64_BATCHED_RESIDUAL_SELECT", "False"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        sampled_lse_gemm_dtype = os.environ.get(
+            "FLASHINFER64_SAMPLED_LSE_GEMM_DTYPE", "fp32"
+        ).strip().lower()
+        if sampled_lse_gemm_dtype not in ("fp32", "bf16"):
+            raise ValueError(
+                "FLASHINFER64_SAMPLED_LSE_GEMM_DTYPE must be 'fp32' or 'bf16'"
+            )
+        short_bucket_tuning = _parse_residual_short_bucket_tuning(os.environ.get(
+            "FLASHINFER64_RESIDUAL_SHORT_BUCKET_TUNING", ""
+        ))
+        residual_bucket_caps = _residual_bucket_caps(short_bucket_tuning)
+        fused_qkv_permute_tuning = _parse_fused_qkv_permute_tuning(os.environ.get(
+            "FLASHINFER64_FUSED_QKV_PERMUTE_TUNING", ""
+        ))
+        fused_output_unpermute_tuning = _parse_fused_output_unpermute_tuning(
+            os.environ.get("FLASHINFER64_FUSED_OUTPUT_UNPERMUTE_TUNING", "")
+        )
         residual_backend = os.environ.get(
             "FLASHINFER64_RESIDUAL_BACKEND", "micro"
         ).lower()
@@ -2070,6 +2427,10 @@ class FlashInfer64Attention:
             float(residual_temperature),
             int(residual_min_top_k),
             int(residual_max_top_k),
+            bool(capped_residual_select),
+            bool(batched_residual_select),
+            sampled_lse_gemm_dtype,
+            short_bucket_tuning,
         ) if route_mode in ("topp_topk", "topk_topp") else ()
         dense_heads_key = ()
         if route_mode == "topp_topk" and dense_layer == layer_idx:
@@ -2079,7 +2440,14 @@ class FlashInfer64Attention:
                 else tuple(sorted(set(int(head) for head in dense_heads)))
             )
         start = _timing_start(timing_recorder, q.device)
-        qh, kh, vh, inverse = _permute_qkv(q, k, v, video_perm, video_len)
+        if fused_qkv_permute_tuning is None:
+            qh, kh, vh, inverse = _permute_qkv(
+                q, k, v, video_perm, video_len
+            )
+        else:
+            qh, kh, vh, inverse = _permute_qkv_fused(
+                q, k, v, video_perm, video_len, fused_qkv_permute_tuning
+            )
         _timing_stop(timing_recorder, start, "flashinfer_qkv_permute", step_idx, layer_idx, q.device)
         full_sequence = qh.shape[1]
         valid_sequence = full_sequence if valid_sequence is None else valid_sequence
@@ -2093,7 +2461,11 @@ class FlashInfer64Attention:
             if valid_sequence < full_sequence:
                 pad = F.scaled_dot_product_attention(padding_q[None], padding_k[None], padding_v[None], dropout_p=0.0)[0]
                 main = torch.cat((main, pad), dim=1)
-            return main.to(q.dtype)[None, :, inverse]
+            if fused_output_unpermute_tuning is None:
+                return main.to(q.dtype)[None, :, inverse]
+            return _unpermute_output_fused(
+                main, inverse, q.dtype, fused_output_unpermute_tuning
+            )
 
         route_valid = (
             reuse_route and self.route is not None and self.route.sequence == sequence
@@ -2278,6 +2650,7 @@ class FlashInfer64Attention:
                         if valid_risk_heads:
                             risk_head_mask[list(valid_risk_heads)] = True
                         score_overrides = None
+                        batched_score_overrides = None
                         if residual_scorer in (
                             "sampled_lse", "sampled_lse_random"
                         ) and valid_risk_heads:
@@ -2289,11 +2662,20 @@ class FlashInfer64Attention:
                                 q_chunk_size=int(os.environ.get(
                                     "FLASHINFER64_SAMPLED_LSE_Q_CHUNK", "128"
                                 )),
+                                gemm_dtype=sampled_lse_gemm_dtype,
                             )
-                            score_overrides = {
-                                head: peak_scores[index:index + 1]
-                                for index, head in enumerate(valid_risk_heads)
-                            }
+                            if batched_residual_select:
+                                # The scorer already returns risk heads in the
+                                # same ascending order as selected_head_ids.
+                                # Feed that contiguous tensor directly to the
+                                # batched selector instead of splitting it
+                                # into views and concatenating it again.
+                                batched_score_overrides = peak_scores
+                            else:
+                                score_overrides = {
+                                    head: peak_scores[index:index + 1]
+                                    for index, head in enumerate(valid_risk_heads)
+                                }
                             _timing_stop(
                                 timing_recorder,
                                 peak_score_start,
@@ -2310,6 +2692,9 @@ class FlashInfer64Attention:
                             min_top_k=residual_min_top_k if high_omission_heads else 0,
                             max_top_k=residual_max_top_k if high_omission_heads else None,
                             score_overrides=score_overrides,
+                            batched_score_overrides=batched_score_overrides,
+                            capped_topk=capped_residual_select,
+                            batched_heads=batched_residual_select,
                         )
                         if residual_scorer in (
                             "random", "sampled_lse_random"
@@ -2342,6 +2727,7 @@ class FlashInfer64Attention:
                     )
                     indices, indptr, buckets, residual_count_stats = _build_residual_csr(
                         residual, collect_stats=collect_route_stats,
+                        bucket_caps=residual_bucket_caps,
                     )
                     active_rows = torch.cat(
                         tuple(rows for _, rows in buckets), dim=0
@@ -2462,6 +2848,7 @@ class FlashInfer64Attention:
             residual_start = _timing_start(timing_recorder, q.device)
             result = _run_residual_micro(
                 qh, kh, vh, route, timing_recorder, step_idx, layer_idx,
+                short_bucket_tuning=short_bucket_tuning,
             )
             _timing_stop(
                 timing_recorder, residual_start, "flashinfer_residual_micro_run",

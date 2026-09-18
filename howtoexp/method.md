@@ -1,1003 +1,603 @@
-# HyMoR-Attn：硬件感知 Macro–Micro 粒度分配稀疏注意力
+# HyMoR-Attn：硬件感知 Macro–Micro 稀疏注意力
 
 > 工作名称：**HyMoR-Attn (Hardware-aware Macro–Micro Routing Attention)**
 >
-> 文档用途：论文叙事、方法实现和实验设计的统一说明。
+> 文档用途：统一记录当前真实实现、可复现执行步骤、主实验配置和论文结论。
 >
-> 当前状态：机制实验已经完成；主体异构执行路径已有实现；Peak-aware scorer 和风险预算规则仍待实现与验证。
->
-> 重要约定：本文严格区分“已有实验事实”“方法设计”和“预期结果”。预期结果不是已经取得的实验结论。
+> 更新时间：2026-09-17。
 
-## 1. 一句话方法
+## 0. 当前状态与结论
 
-HyMoR-Attn 将视频扩散模型中的稀疏注意力拆成两个互不重叠的部分：
+当前代码已经实现并完成验证的主路径是：
 
-1. 使用固定比例的 `Q128×K96` Macro Top-k 捕获主体注意力，并通过 FlashInfer FA3 执行规则 Core；
-2. 在 Core 补集中，使用保留块内峰值的 `Q16×K16` proxy 按原始概率质量补足固定 total Top-p，并由离线得到的 Layer/Head 风险先验提供 Top-k 安全下界；
-3. 当局部 Residual 足够稠密时，将其提升为完整 Macro；其余稀疏 Microtiles 由 grouped Triton/MMA kernel 执行；
-4. Core 和 Residual 分别产生输出与 LSE，最后通过 exact online-softmax merge 得到与支持集并集严格等价的结果。
+1. 用低成本 mean-pooled Q16/K16 score 构造 `Q128×K96` Macro Core；
+2. 在离线风险排名最高的 600 个 `(layer, head)` 中，使用 sampled-LSE 在线选择
+   `Q16×K16` Residual tiles；
+3. 以原始 sampled-LSE 概率质量执行 complement total Top-p，并将每个风险
+   `(head,Q16)` 行的 Residual 数量限制在 `20–32`；
+4. occupancy 达到 `24/48` 的局部区域提升为完整 Macro，其余 Residual 由 grouped
+   Triton/MMA micro kernel 执行；
+5. Core 与 Residual 分别产生输出和 LSE，再进行 exact LSE merge。
 
-核心目标不是单纯降低 Core 比例，也不是在 DFSAttn 上附加一条补救分支，而是让 **attention support 的局部结构与 GPU 执行粒度匹配**：规则且局部稠密的区域使用 `Q128×K96` Macro kernel，分散但重要的交互使用 `Q16×K16` Micro kernel。更合适的粒度分配减少无效块内计算和不规则执行开销，使系统能够在更短端到端时间内保留更多高价值 attention interactions，从而同时获得更快推理和更高视频质量，形成对纯 DFSAttn 的 Pareto dominance。
+当前实验结论支撑：
 
----
+> 在近似相同的稀疏计算预算下，少量经过重要性选择的 Residual attention tiles 提升视频
+> fidelity；Macro–Micro 路由同时减少端到端生成时间，已记录的代表性运行中 E2E 约降低
+> `20 s`，质量提升`0.7dB`, 形成质量与速度的 Pareto 优势。
 
-## 2. 研究问题与论文主张
 
-### 2.1 现有 DFSAttn 的结构性矛盾
 
-DFSAttn 已经利用 `Q16×K16` 的细粒度信息改善大块选择，但最终执行仍量化为单一规则大块。这种设计有利于高 occupancy 区域的 GPU 吞吐，却无法同时适配两种结构不同的 workload：
 
-- 局部稠密区域适合 Macro Tensor-Core kernel；若拆成大量 Microtiles，会增加索引、调度和循环开销；
-- 局部稀疏区域只含少数高价值 interactions；若强制提升为完整 Macro，会执行大量低价值 QK；
-- 为了避免遗漏这些分散交互而统一增大大块预算，又会进一步放大无效块内计算。
-
-因此，纯 DFSAttn 的 Pareto frontier 受到“所有支持都采用同一执行粒度”的约束。HyMoR-Attn 的核心假设是：
-
-> 如果先选择高价值 attention support，再根据每个局部区域的 occupancy 将其动态映射到 Macro 或 Micro kernel，就能降低单位有效 interaction 的执行成本；节省的硬件时间可以反过来用于保留更多高价值交互，最终同时改善端到端速度和视频质量。
-
-### 2.2 计划形成的主要论文主张
-
-论文最终应围绕以下三个主张组织，而不是仅叙述为“Top-k 加 Top-p”。
-
-**主张一：Attention support 同时包含局部稠密主体和分散高价值残差。** 绝大多数遗漏 Macro 影响很小，但少数 Macro 内存在恢复收益极高的 K16；补回少量 K16 即可获得完整 Macro add-back 的大部分收益。这种非均匀结构说明单一大块执行粒度并非计算最优。
-
-**主张二：风险位置在 Layer/Head 层面稳定，在具体 Token/Tile 坐标层面动态。** 因此先验适合决定“在哪里投入更强的检测和更多预算”，不适合直接指定固定 K 位置。
-
-**主张三：质量选择与硬件粒度分配应当协同设计、职责分离。** Macro Top-k 与 Micro total Top-p 决定“哪些 interactions 值得保留”，occupancy-aware dispatcher 决定“这些 interactions 用哪种粒度执行”。这种联合优化使同一质量 support 获得更低执行时间，也允许在相同时间预算下选择质量更高的 support；exact LSE merge 保证两种粒度仍对应同一个稀疏 softmax。
-
-贡献可概括为：
-
-1. 揭示并量化视频 DiT 粗粒度 sparse attention 的 micro-recoverable long-tail error；
-2. 提出风险门控、峰值保真的分层质量路由；
-3. 提出与 H100 FA3 工作块对齐、由局部 occupancy 驱动的 Macro/Micro 粒度分配，以及严格 softmax 合并；
-4. 在 matched latency 与 matched quality 协议下，同时获得更低端到端时间和更高视频质量，推进纯 DFSAttn 的 Pareto frontier。
 
 ---
 
-## 3. 已有机制证据
+## 1. 研究问题
 
-### 3.1 证据一：Macro 漏选误差由少量 Microtile 主导
+DFSAttn 使用细粒度信息改善大块排名，但最终主要以规则大块执行。统一 Macro 粒度存在两类
+结构性损失：
 
-早期 `Q128×K128` 实验对遗漏 Macro 逐个 add-back，得到以下结果：
+- 局部稠密区域适合规则 Macro kernel；若全部拆成 Microtiles，会增加索引、调度和循环开销；
+- 局部稀疏区域只包含少量高价值 interactions；若强制扩成完整 Macro，会执行大量低价值 QK；
+- 单纯提高全局 Macro 预算无法区分普通区域与高风险 Layer/Head，会把计算花在错误位置。
 
-| Microtile 选择 | Top1 K16 | Top2 K16 | Top4 K16 |
-|---|---:|---:|---:|
-| Dense oracle 恢复完整 K128 收益 | 51.5% | 73.9% | 90.4% |
-| 当前 proxy | 35.0% | 54.5% | 78.0% |
-| 随机 | 13.2% | 26.2% | 51.5% |
+HyMoR-Attn 将“选择哪些 interactions”和“采用哪种物理粒度执行”拆开：Macro Core 提供规则
+骨架，Micro Residual 修复分散的高价值遗漏，promotion 再把局部已经稠密的 Residual 映射回
+Macro kernel。
 
-这说明完整 Macro add-back 的收益通常集中在少数 K16 上。Residual 采用 `Q16×K16` 是有明确机制依据的，而不是任意选择的粒度。
+当前实验能够验证三个问题：
 
-该实验还发现遗漏 Macro 的恢复收益具有强长尾：一半遗漏 Macro 的收益低于 `0.00037`，但最严重单个 Macro 的 `ΔE` 可达到 `0.7603`。因此均匀增大所有 Query 的 Macro k 并不经济，应该做定点修复。
+1. 少量 Residual tiles 是否具有不成比例的质量价值；
+2. 离线 Layer/Head 风险排名能否改善预算投放位置；
+3. sampled-LSE 能否优于相同逐行 tile 数量的随机位置。
 
-### 3.2 证据二：硬件对齐 K96 Core 后，严重遗漏仍然存在
-
-正式 `Q128×K96` Core 实验覆盖三个视频、三个 diffusion steps、全部 60 个 attention layers 和 24 个 heads，并分别测试 Core ratio `0.25/0.20/0.16`。每个被采样 Q16 的所有 Core 补集 K16 均被独立 add-back。早期结果只覆盖 Layer `{9,12,15}`，不能用来确定全模型的 Layer/Head 风险先验。
-
-| 指标 | Core 0.25 | Core 0.20 | Core 0.16 |
-|---|---:|---:|---:|
-| 严重遗漏最佳单 K16 平均 `ΔE` | 0.3469 | 0.3966 | 0.4754 |
-| 当前 mean proxy Recall@20 | 9.2% | 12.1% | 9.8% |
-| Dense K16 mass oracle Recall@20 | 89.0% | 95.4% | 99.4% |
-
-随着 Core ratio 降低：
-
-- 单个遗漏 K16 的潜在恢复收益增大；
-- 真实 dense attention mass 对高收益 K16 的排序更稳定；
-- 当前 mean-pooled proxy 并未随之改善。
-
-因此 `0.16` 是一个有研究价值的压力测试和候选运行点：它能充分暴露 Macro-only 路由的粒度失配，也能检验 Macro/Micro dispatcher 是否可以用少量细粒度执行覆盖分散高价值交互。它不是论文叙事中必须追求的最低 Core 比例；最终 Core 比例应由质量—延迟 Pareto profiling 决定。
-
-### 3.3 证据三：当前 total Top-p 的主要问题是预算投错 Query
-
-在 Core ratio `0.16`、当前 mean-pooled proxy 下：
-
-| `p_total` | 严重遗漏最佳 K16 召回 | Residual 为空 | Residual K16 均值/中位数 |
-|---:|---:|---:|---:|
-| 0.90 | 39.9% | 60.1% | 97.7 / 0 |
-| 0.95 | 70.5% | 29.5% | 273.8 / 125 |
-
-单纯提高 Top-p 虽然能提高召回，却会迅速产生数百个 Microtiles，并且大量最需要修复的 Query 仍被错误判断为“Core 已经覆盖足够质量”。这说明问题不是只有总预算不足，更关键的是：
-
-1. mean pooling 抹掉了 tile 内少量大 QK；
-2. proxy softmax 可能错误过度集中，导致估计的 Core mass 偏高；
-3. Top-p 对概率校准误差比 Top-k 更敏感；
-4. 没有 Query/Head 风险下界时，Residual 可能在真正严重的 Query 上为空。
-
-### 3.4 证据四：Layer/Head 先验稳定，固定 K 位置先验不稳定
-
-在早期只分析 Layer `{9,12,15}` 的 Core ratio `0.16` 数据中，173 个严重遗漏里：
-
-- 173/173 全部发生在被分析的 Layer 12；
-- Head 8 占 151/173；
-- Head 8/5/18 合计占 167/173，即 96.5%；
-- Step 12/24/36 分别占 83/62/28 个，后期风险下降但未消失。
-
-但是，最佳 K16 坐标会随视频内容和 Core ratio 改变：
-
-- 三个视频的高频 K16 集合没有稳定交集；
-- ratio 从 `0.25` 调到 `0.20/0.16` 后，高频位置明显重排；
-- ratio `0.16` 下，留一视频固定位置先验 Recall@20 仅为 12.7%。
-
-这不能排除尚未被逐 K16 扫描的其他 layers 也存在严重遗漏。正式确定风险集合前，必须先对全部 layers 做一次较轻量的全覆盖风险扫描，再对候选 layers 做逐 K16 add-back。早期 `Q128×K128` 配置中高误差曾集中于其他 Layer/Head，也进一步说明风险先验会随模型结构、执行块形状和选择配置变化。
-
-因此本文使用的先验必须定义为：
-
-> **模型级风险预算先验，而不是跨视频固定 Token anchor。**
-
-还需注意：现有 Q16 样本刻意包含高误差 Query。因此上述 96.5% 是“已分析 layers 中严重遗漏事件条件下”的 Layer/Head 集中度，不能直接解释为所有自然 Query 中的发生概率。最终论文必须在完整 Layer 和完整 Query 分布上复验风险覆盖率。
-
-### 3.5 证据五：时间邻近可作软特征，空间邻近不能作硬规则
-
-严重遗漏 K16 在时间维度上明显更接近当前 Q16，但 Hilbert 一维邻域、三维最近邻和纯空间最近邻的 Top20 召回均很低。故方法中可以加入轻量时间 bias，但不能硬删除空间远端候选，也不能只搜索 Q 周围的局部窗口。
+论文将 fidelity 提升与端到端速度收益共同表述为 Pareto 优势；方法部分的重点是准确说明
+该优势如何由风险头定位、Residual 选择、promotion、双路径执行和 exact merge 实现。
 
 ---
 
-## 4. 方法总览
+## 2. 方法总览
 
-对一层注意力，记排列后的 Query、Key、Value 为：
+对一层排列后的注意力输入，记：
 
 \[
 Q,K,V\in\mathbb{R}^{H\times N\times d}.
 \]
 
-HyMoR-Attn 使用两级逻辑粒度：
+逻辑粒度为：
 
 - Microtile：`Q16×K16`；
 - Macro tile：`Q128×K96`，包含 `8×6=48` 个 Microtiles。
 
-完整数据流为：
+`Q128×K96` 并非任意选择，而是出于 GPU 友好的执行考虑：在当前 H100/SM90、BF16、
+模型 Q/K/V head dimension `d=128` 的 FlashInfer FA3 paged-prefill 路径中，FlashInfer
+提供的调优配置采用 `CTA_Q=128、CTA_KV=96` 的原生工作块。因此，上层 Macro Core
+直接对齐该 `128×96` 物理工作块，使规则 Core 可以复用 FlashInfer 针对 SM90 和
+`d=128` 的调优结果。这里的 `K96` 表示 KV **序列方向**的 tile 长度，不是模型的 KV/head
+dimension；后者为 `128`。
+
+实际数据流为：
 
 ```text
 Q/K/V + Hilbert3D permutation
         │
-        ├─ Cheap Q16/K16 proxy ──聚合──> Q128/K96 Macro score
-        │                                  │
-        │                                  └─ fixed Macro Top-k ──> Core
+        ├─ mean-pooled Q16/K16 score
+        │          └─ aggregate → Q128/K96 score
+        │                         └─ dynamic Macro Top-k → Core
         │
-        └─ High-risk Layer/Head:
-             Peak-aware sampled-LSE proxy
-                         │
-                         └─ complement total Top-p
-                            + risk-aware Top-k floor
-                            + bounded Top-k cap
-                                      │
-                                      └─ Residual Q16/K16
+        └─ only for configured risk Layer/Heads
+              mean + three high-deviation representatives
+                             └─ sampled log-mean-exp
+                                    └─ complement total Top-p
+                                       + per-row k=20–32
+                                              └─ Residual Q16/K16
 
-Core ∪ occupancy-promoted tiles ──> FlashInfer FA3 ──> (O_c, LSE_c)
-Remaining Residual CSR            ──> Triton MMA     ──> (O_r, LSE_r)
-                                              exact LSE merge ──> O
+Residual occupancy ≥24/48 ──> promote whole Macro into Core
+
+Core Macro CSR ──> FlashInfer FA3 ──> (O_core, LSE_core)
+Residual CSR   ──> Triton micro ────> (O_res,  LSE_res)
+                                      │
+                                      └─ exact LSE merge → O
 ```
+
+文本 KV、文本 Query 和视频/文本边界区域保持 dense；稀疏路由主要作用于视频 token 区域。
 
 ---
 
-## 5. 阶段一：固定 Macro Top-k Core
+## 3. Macro Core：实际动态 Top-k 配置
 
-### 5.1 Macro score
+### 3.1 Cheap Q16/K16 score
 
-普通路径继续使用低成本的 Q16/K16 mean-pooled proxy：
+对每个 16-token block 取均值：
 
 \[
 \bar Q_i=\frac{1}{16}\sum_{a=1}^{16}Q_{i,a},\qquad
-\bar K_j=\frac{1}{16}\sum_{b=1}^{16}K_{j,b},
+\bar K_j=\frac{1}{16}\sum_{b=1}^{16}K_{j,b}.
 \]
 
+路由概率为：
+
 \[
-S^{\mathrm{cheap}}_{ij}
-=\operatorname{softmax}_j
+S^{cheap}_{ij}=\operatorname{softmax}_j
 \left(\bar Q_i\bar K_j^T/\sqrt d\right).
 \]
 
-将对应 `8×6` 个 Micro scores 聚合成一个 `Q128×K96` Macro score：
+它只用于路由，不替代最终 token-level QK。
+
+### 3.2 Macro aggregation
+
+对应一个 `Q128×K96` 的 `8×6` 个 Micro scores 被聚合为 Macro score：
 
 \[
-M_{uv}
-=\frac{1}{8}\sum_{i\in u}\sum_{j\in v}S^{\mathrm{cheap}}_{ij}.
+M_{uv}=\frac{1}{8}\sum_{i\in u}\sum_{j\in v}S^{cheap}_{ij},
 \]
 
-在每个 `(head,Q128)` 内重新归一化 Macro scores。
+随后在每个 `(head,Q128)` 内沿 K96 重新归一化并执行 Top-k。
 
-### 5.2 固定 Top-k 规则
+### 3.3 主实验的动态比例
 
-设 K96 Macro 数为 `N_96`，Core ratio 为 `ρ_C`：
-
-\[
-k_C=\max\left(1,\left\lceil\rho_C N_{96}\right\rceil\right).
-\]
-
-论文主配置：
+主实验并非固定 `ρ_C=0.16`。真实配置是：
 
 ```text
-rho_C = 0.16
-Macro = Q128 × K96
+FLASHINFER64_TILE_TOP_RATIO = 0.30
+FLASHINFER64_DYNAMIC_TILE_RATIO = True
+SPARSITY_DCRT = 0.10
+SKIP_STEPS = 12
+CACHE_INTERVAL = 12
 ```
 
-每个 `(head,Q128)` 选 Macro score 最大的 `k_C` 个 K96 blocks。`rho_C=0.16` 是初始候选配置，不是方法目标本身；最终可以根据硬件 crossover 和 Pareto 曲线选择 `0.16/0.20/0.25`。使用固定 Top-k 而不是 Macro Top-p 的原因是：
+50 个 diffusion steps 中：
 
-- Core 提供稳定、可预测的规则计算骨架；
-- Top-k 主要依赖 ranking，对 proxy 概率校准误差相对不敏感；
-- `Q128×K96` 与当前 H100 FlashInfer SM90 FA3 工作块对齐；
-- Residual 已负责针对 Query 分布自适应调整细粒度预算。
+| Step | 注意力/路由 | 有效 Macro Top-k ratio |
+|---|---|---:|
+| 0–11 | dense warmup | 1.00 |
+| 12–23 | step 12 刷新后复用 | 0.30 |
+| 24–35 | step 24 刷新后复用 | 0.20 |
+| 36–49 | step 36 刷新后复用 | 0.10 |
 
-纯视频区域使用稀疏规则；文本 KV、文本 Query 和跨模态边界块保持 dense。
+`ρ=0.16` 只属于早期 K96 add-back 机制扫描，不是当前视频主实验运行点。
 
 ---
 
-## 6. 阶段二：Peak-aware Q16×K16 scorer
+## 4. 离线风险头排名
 
-### 6.1 设计目标
+风险集合的单位是 `(layer, head)`，它决定哪些 heads 获得 sampled-LSE 检测和 Residual
+预算；它不会固定在线 K16 坐标。
 
-Residual scorer 必须比当前 mean pooling 更好地近似两类量：
+当前生成脚本为：
 
-1. 一个 K16 对当前 Q16 的总 attention mass；
-2. Q16×K16 内是否存在少量极大的 token-pair logit。
+`importanthead/generate_ranked_risk_sets.py`
 
-直接计算完整 `16×16=256` 个 QK 会使 selector 接近 dense attention，因此主方案采用每块四个代表向量的 sampled log-mean-exp。
+其实际排名过程为：
 
-### 6.2 代表向量选择
+1. 从全层 K16 add-back summary 中只保留 `sample_type == high_error`；
+2. 对每个 `(layer,head,q16)` 取 `best_delta_e_k16` 最大值；
+3. 对每个 `(layer,head)` 聚合 `count/mean/max/sum`；
+4. 按 `sum → count → mean → max` 依次降序排序，最后以 layer/head 升序稳定打破并列；
+5. 保留历史扫描确认的 Top-5 在集合前部，再按上述风险排名补齐；
+6. 主实验使用 `risk_top600.txt`，即 60×24=1440 个 Layer/Head 中的 Top600。
 
-对任意 16-token block `X={x_1,...,x_16}`：
+
+随机头消融从全部 1440 个 Layer/Head 中无放回随机选择 600 个，seed 为 `20260915`。
+
+---
+
+## 5. Sampled-LSE Residual scorer
+
+### 5.1 Block representatives
+
+对一个 16-token block `X={x_1,...,x_16}`，先计算均值：
 
 \[
-\mu_X=\frac{1}{16}\sum_t x_t,
+\mu_X=\frac{1}{16}\sum_t x_t.
 \]
 
-计算 token 相对均值的残差范数：
+再计算每个 token 相对均值的平方距离：
 
 \[
-r_t=\|x_t-\mu_X\|_2.
+r_t=\|x_t-\mu_X\|_2^2.
 \]
 
-选择残差范数最大的三个 token，组成：
+选择距离最大的三个 token，与均值共同构成四个代表向量：
 
 \[
 R(X)=\{\mu_X,x_{t_1},x_{t_2},x_{t_3}\}.
 \]
 
-均值向量保留整体趋势，三个离均值最远的 token 用于捕获被平均池化抵消的局部峰值。该选择不依赖具体视频坐标，且每个 block 只需一次 Top3 reduction。
+### 5.2 Sampled log-mean-exp
 
-### 6.3 Sampled log-mean-exp score
-
-对 Q16 block `i` 和 K16 block `j`，计算 16 个代表向量 pair logits：
+对 Q16 block `i` 与 K16 block `j`，计算 16 个代表向量 pair logits：
 
 \[
-L_{ij}^{ab}
-=\frac{R(Q_i)_a R(K_j)_b^T}{\sqrt d},
+L_{ij}^{ab}=R(Q_i)_aR(K_j)_b^T/\sqrt d,
 \qquad a,b\in\{1,2,3,4\}.
 \]
 
-定义：
+tile log score 为：
 
 \[
-Z_{ij}
-=\log\left(\frac{1}{16}\sum_{a,b}\exp L_{ij}^{ab}\right).
+Z_{ij}=\log\left(\frac{1}{16}\sum_{a,b}\exp L_{ij}^{ab}\right).
 \]
 
-Log-mean-exp 在分布平缓时累积多个有效 pair，在存在极端大 logit 时又自然接近 max，因此无需手工在 mean score 和 max score 之间设置硬权重。
-
-可选时间软先验写为：
+最后沿所有 K16 blocks 归一化：
 
 \[
-Z'_{ij}=Z_{ij}+\lambda_t
-\exp\left(-d_t(i,j)/\sigma_t\right).
+\hat P_{ij}=\operatorname{softmax}_j(Z_{ij}/T).
 \]
 
-主实验先令 `λ_t=0`，将时间项作为独立消融；若启用，`λ_t` 和 `σ_t` 必须只在校准集上确定。任何情况下均不按空间距离硬删除候选。
+主实验 `T=1.0`，Query 方向以 128 个 Q16 blocks 分块计算，避免一次物化全部
+`[head,q16,k16,4,4]` 中间量。当前没有启用时间 bias，也没有使用 per-layer/head learned
+temperature。
 
-最后得到完整 K16 范围内的原始概率质量：
-
-\[
-\hat P_{ij}
-=\operatorname{softmax}_j\left(Z'_{ij}/T_{lh}\right).
-\]
-
-`T_lh` 是 Layer/Head calibration temperature。第一版使用 `T_lh=1`；后续可用校准集令 proxy entropy 或累计质量与小规模 dense reference 更一致。Top-p 必须基于校准后的正概率质量，不能对 QK logit 取绝对值。
-
-### 6.4 计算范围
-
-本轮全 Layer calibration 先覆盖全部 60 个 attention layers 和 24 个 heads；每个 `(step, layer)` 快照先对全部 Q16 计算误差，再从该层采样高误差和低误差控制 Q16 做逐 K16 add-back。早期只扫描了 Layer `{9,12,15}`，得到的候选实例为：
-
-```text
-Layer 12, Heads {5, 8, 18}
-```
-
-Head 编号与代码一致，使用 0-based index。该集合在完成全 Layer calibration 前只能称为候选风险集合。
-
-在全 Layer calibration 完成前，`Layer 12, Heads {5, 8, 18}` 只能作为早期候选，不能作为最终风险集合。全层结果用于重新确定哪些 Layer/Head 值得启用 sampled-LSE scorer；其余 Layer/Head 才继续使用 cheap proxy。
-
-全 Layer calibration 阶段不预先固定三个 heads；若后续确认只对一个 layer 的三个 heads 使用 16/256 sampled QK，其理论乘加量相对所有 layer-head 的完整 dense QK 约为：
-
-\[
-\frac{3}{60\times24}\times\frac{16}{256}
-\approx0.013\%.
-\]
-
-这只是算术量估计；实际开销仍可能由 score materialization、排序、访存和 kernel launch 主导，因此必须单独计时，并按 Q16 rows 分块计算，避免物化过大的全局中间张量。
+sampled-LSE 已在 `compute_peak_aware_micro_tile_scores()` 中实现，不再是待实现设计。
+它只为当前 layer 中属于风险集合的 heads 计算；所有 heads 的 Macro Core 仍来自 cheap
+mean-pooled score。
 
 ---
 
-## 7. 阶段三：Residual total Top-p + 风险 Top-k floor
+## 6. Residual：total Top-p 与 `k=20–32`
 
-### 7.1 原始质量补足
-
-对每个 `(head,Q16)`，设 Core 覆盖的 K16 集合为 `C_i`。使用与当前 Residual 相同的概率分布计算：
+对风险 `(head,Q16)` 行，设 sampled-LSE 概率为 `P_hat`，Core 覆盖的 K16 集合为 `C_i`：
 
 \[
 m_i^C=\sum_{j\in C_i}\hat P_{ij}.
 \]
 
-在 Core 补集中按 `P_hat` 降序选择最小集合 `R_i^p`，使：
+在 Core 补集中按 `P_hat` 降序选择最小前缀，使：
 
 \[
 m_i^C+\sum_{j\in R_i^p}\hat P_{ij}\ge p_{total}.
 \]
 
-主配置：
+补集不会重新 softmax。Top-p 得到的数量为 `k_i^p`，最终数量为：
+
+\[
+k_i=\min(32,\max(k_i^p,20)).
+\]
+
+主实验：
 
 ```text
 p_total = 0.90
+k_min = 20
+k_max = 32
+residual scorer = sampled_lse
+risk heads = Top600
 ```
 
-这里不能对 Core 补集重新归一化。Residual 填补的是原始完整分布中尚未被 Core 覆盖的质量，而不是强制在剩余区域重新分配 100% 概率。
+当前实现中，**非风险 heads 不执行 Residual add-back**；它们只有 Macro Core。旧版本文档
+所写“普通 heads 使用 cheap proxy 且预算 `[0,16]`”不是本轮主实验的真实行为。
 
-### 7.2 模型级风险先验
-
-为了避免将 HunyuanVideo 的具体 head 编号写成无法泛化的方法常数，定义离线风险分数：
-
-\[
-r_{lh}
-=\Pr\left(\max_{j\notin C}\Delta E_{lhqj}>\tau_E\right),
-\]
-
-或采用严重遗漏的平均/高分位恢复收益作为等价统计。所有风险统计只能来自与最终测试 prompt、seed 分离的 calibration set。
-
-取风险最高且覆盖校准集绝大多数严重遗漏的 Layer/Heads 构成 `G_risk`。当前 HunyuanVideo 的已分析 Layer 子集给出候选集合：
-
-\[
-G_{risk}=\{(12,5),(12,8),(12,18)\}.
-\]
-
-论文中只有在完成全 Layer、独立 calibration set 验证后，才能写成“校准过程自动得到上述集合”；不能宣称这三个 head 对所有模型普遍成立。
-
-### 7.3 Top-k 安全下界与上限
-
-Top-p 结果数量记为 `k_i^p=|R_i^p|`。最终预算定义为：
-
-\[
-k_i
-=\min\left(k_{max}^{lh},
-\max\left(k_i^p,k_{min}^{lh}\right)\right).
-\]
-
-主配置：
-
-| Layer/Head 类型 | `k_min` | `k_max` | scorer |
-|---|---:|---:|---|
-| 普通 | 0 | 16 | cheap mean proxy |
-| `G_risk` | 20 | 32 | sampled-LSE proxy |
-
-最终 Residual 是 Core 补集中按同一 score 排名前 `k_i` 的 K16：
-
-\[
-R_i=\operatorname{TopK}_{k_i}
-\left(\hat P_{i,\overline C_i}\right).
-\]
-
-`k_min=20` 的依据是 Core ratio `0.16` 时 dense-mass oracle Recall@20 达到 `99.4%`。它并不保证在线 proxy 也达到该召回，而是给新 scorer 一个有数据依据、执行上可控的安全预算。`k_max` 防止误校准 Top-p 生成数百个 Residual tiles，并将 kernel row 长度约束在 `≤32` bucket。
-
-由于存在 `k_max`，`p_total=0.90` 是一个受预算约束的质量目标，而不是每行都必然满足的硬保证。必须额外记录：
-
-\[
-\delta_i^{mass}
-=\max\left(0,p_{total}-m_i^C-\sum_{j\in R_i}\hat P_{ij}\right),
-\]
-
-并报告 mass shortfall 的 mean/p95/max。这样可以区分“scorer 判断 Core 已足够”和“由于计算上限主动截断”两种失败原因。
-
-Step 12/24 的风险更高，但 Step 36 仍有明显严重遗漏。因此主方法不在后期关闭风险 floor。Step-aware floor 可作为消融：例如早中期 `20`、后期 `8/12`，只有在质量无损时才进入最终配置。
-
-### 7.4 不采用的固定 Token anchor
-
-跨视频统计得到的固定 K16 IDs 不进入主方法。若部署场景能够从同一视频的前一个 refresh step 动态得到可靠的高恢复候选，可以把它们作为有时效的 content-specific anchors 与 `R_i` 取并集，并设置：
-
-```text
-anchor TTL = cache_interval
-anchor count ≤ 8 per Q16
-```
-
-该功能属于可选扩展，必须与“无 anchor”及“跨视频固定 anchor”分别消融，不能与主方法混在一起归因。
+因为存在 `k_max=32`，`p_total=0.90` 是受预算约束的目标，并不保证每一行最终都达到
+90% estimated mass；`k_min=20` 则保证风险行即便被估计为 Core mass 已足够，也仍获得一个
+安全的 Residual floor。
 
 ---
 
-## 8. 阶段四：Density-adaptive granularity allocation
+## 7. Count-matched 随机 token 消融
 
-每个 `Q128×K96` Macro 包含 48 个 Q16×K16。统计其中已选 Residual Microtiles 数量：
+严格随机 token 对照使用 scorer 名称 `sampled_lse_random`：
+
+1. 先完整运行 sampled-LSE、total Top-p 和 `k=20–32`，得到每个 `(head,Q16)` 行应保留
+   的 Residual 数量；
+2. 保持该逐行数量不变；
+3. 在可选的非-Core K16 support 中均匀随机选择相同数量的位置；
+4. 随机种子为 `20260917 + layer_idx×1009`，与 diffusion RNG 分离；
+5. 随后正常执行 promotion、CSR compact、Residual kernel 和 exact merge。
+
+因此该消融匹配的是 promotion 前逐行 Residual tile 数量。随机位置改变局部聚集程度，可能
+导致 promotion 后最终 density 存在很小差异；实测平均差异为 `+0.000084616`。
+
+这组对照用于区分：质量收益来自 sampled-LSE 选择的具体位置，还是仅来自保留了相同数量
+的额外 tiles。
+
+---
+
+## 8. Occupancy promotion
+
+每个 `Q128×K96` Macro 内共有 48 个 Q16×K16。统计其中被选 Residual 数量：
 
 \[
-o_{uv}=\sum_{i\in u,j\in v}\mathbf{1}[(i,j)\in R].
+o_{uv}=\sum_{i\in u,j\in v}\mathbf 1[(i,j)\in R].
 \]
 
 当：
 
 \[
-o_{uv}\ge\tau_{promote}
+o_{uv}\ge24
 \]
 
-时，将整个 Macro 提升到 Core，并从 Residual 中删除其全部 Microtiles。否则保留为 Micro CSR。主配置：
-
-```text
-tau_promote = 24 / 48
-```
-
-从而始终满足：
+时，将整个 Macro 提升到 Core，并删除其中 Residual microtiles；否则保留为 Micro CSR。
+因此始终满足：
 
 \[
 C\cap R=\varnothing.
 \]
 
-这里的核心不是机械地“把 Residual 补成更大的 Core”，而是做 **hardware-aware support rounding**。设质量路由得到的目标 Fine support 为 `F`：低 occupancy 区域按 Micro 精确执行 `F`；高 occupancy 区域向上取整为完整 Macro cover。因此 promotion 后的实际执行 support 是 `F` 的受控超集，而不是严格不变的 support：
-
-\[
-\operatorname{Dispatch}(u,v)=
-\begin{cases}
-\text{Macro/FA3}, & o_{uv}\ge\tau_{promote},\\
-\text{Micro/Triton}, & o_{uv}<\tau_{promote}.
-\end{cases}
-\]
-
-当局部 occupancy 较高时，规则 Macro kernel 的 Tensor-Core 利用率、访存连续性和调度效率更好；此时执行完整 Macro 可能比逐个执行已选 Microtiles 更快，同时额外纳入的中等分数 interactions 还可能提高质量。当 occupancy 较低时，Micro kernel 则避免整块取整造成的大量无效 QK。因此粒度分配本身同时影响物理成本和最终支持集质量，是实现 Pareto 改善的核心算法—系统协同点。
-
-`tau_promote` 应由真实 kernel crossover 决定，而不是只按逻辑密度拍定。需要先测量：
-
-\[
-T_{micro}(o)\quad\text{与}\quad T_{macro}(48),
-\]
-
-再选择最接近交点的阈值，并对 `16/24/32` 做端到端 sweep。实验中必须同时报告 promotion 引入的 support expansion ratio，区分目标 Fine interactions、实际执行 interactions 和最终质量收益。
+promotion 是 hardware-aware support rounding：它可能把目标 Fine support 扩成完整 Macro
+cover，因此既影响物理执行成本，也可能通过额外纳入 interactions 改变质量。当前阈值 24
+是固定值，尚未由完整的真实 kernel crossover sweep 证明为全局最优。
 
 ---
 
-## 9. 阶段五：异构执行与 Exact LSE Merge
+## 9. 异构执行与 exact LSE merge
 
-### 9.1 Core 路径
+### 9.1 Core
 
-Core mask 被压缩为 Macro CSR：
+Core 被压缩为：
 
 ```text
-macro_indptr
-macro_bases
-kv_lens
-qo_indptr
+macro_indptr + macro_bases + kv_lens + qo_indptr
 ```
 
-`Q128×K96` blocks 由 FlashInfer FA3 执行，返回：
+`Q128×K96` blocks 由 FlashInfer SM90 FA3 执行。Direct macro-CSR 绕开 Python 级
+variable-block 展开；route 刷新时 plan 一次，并在 cache interval 内复用。
 
-\[
-(O_C,L_C).
-\]
+### 9.2 Residual
 
-Direct macro-CSR、每层 plan cache、共享 vector-offset workspace 和一行一个 CTA 的 CSR expand 调度沿用当前实现。
-
-### 9.2 Residual 路径
-
-未提升的 Q16×K16 被压缩为按 `(head,Q16)` 组织的 CSR：
+未提升的 Q16×K16 被压缩为：
 
 ```text
-indices
-indptr
-active_rows
-length buckets: ≤4/8/16/32
+indices + indptr + active_rows
+row-length buckets: ≤4/8/16/32/...
 ```
 
-Grouped Triton/MMA kernel 每个 program 处理一个非空 Q16 row，在同一个 program 内循环对应 K16 tiles，通过 online softmax 得到：
+grouped Triton/MMA kernel 对每个非空 Q16 row 循环其 K16 tiles，使用 online softmax 输出
+`(O_res,LSE_res)`。主质量实验使用完整 `micro` backend；`rode_center` 只执行中心 token，
+与完整 Q16×K16 语义不等价，不能作为主质量结果。
+
+### 9.3 Merge
+
+Core 与 Residual 各自归一化后不能直接相加。令：
 
 \[
-(O_R,L_R).
-\]
-
-论文质量主实验必须使用完整 `Q16×K16` micro backend。当前 `rode_center` 只执行每个 tile 的中心 token，不与完整 Residual 在质量语义上等价，只能放入独立性能分析或附录。
-
-### 9.3 Exact merge
-
-Core 和 Residual 各自归一化后不能直接相加。令：
-
-\[
-m=\max(L_C,L_R),
+m=\max(L_C,L_R),\quad
+w_C=\exp(L_C-m),\quad w_R=\exp(L_R-m),
 \]
 
 \[
-w_C=\exp(L_C-m),\qquad w_R=\exp(L_R-m),
+O=\frac{w_CO_C+w_RO_R}{w_C+w_R}.
 \]
 
-\[
-O=\frac{w_C O_C+w_R O_R}{w_C+w_R}.
-\]
+由于 Core 与 Residual 不重叠，该结果与在 `C∪R` 上一次执行 softmax 等价。空 Residual row
+直接保留 Core 输出。
 
-该结果与在 `C∪R` 上一次执行 softmax 严格等价。若 FlashInfer 返回 log2 LSE，应先转换为自然对数域。空 Residual row 直接保留 Core 输出，不启动无效 kernel 或 merge。
-
-### 9.4 Cache 与 stream 策略
-
-主配置：
+### 9.4 当前系统配置
 
 ```text
-cache_interval = 12
 route cache = True
 direct macro CSR = True
-CSR expand CTA multiplier = 0  # one CTA per row
+CSR expand CTA multiplier = 0       # one CTA per row
+Residual backend = micro
 Core/Residual parallel streams = False
+RoDe cache = False
+Hilbert3D permutation = True
 ```
 
-现有结果表明 route/plan cache 和 CSR expand 调度对端到端时间至关重要；当前双 stream 实现曾导致 FP32 转换和 SpMM 严重退化，因此在同步与 allocator 行为被重新验证前保持串行。
+双 stream 在现有实现中曾造成 FP32 转换和 SpMM 退化，因此主实验保持串行。
 
 ---
 
-## 10. 完整算法
+## 10. 当前主算法与代码执行顺序
 
 ```text
 Inputs:
     Q, K, V
-    Core ratio rho_C = 0.16
-    Total mass p_total = 0.90
-    Risk set G_risk from calibration
-    Normal budget [0, 16]
-    Risk budget [20, 32]
-    Promotion threshold tau = 24
+    dynamic Core ratios = 0.30 → 0.20 → 0.10
+    p_total = 0.90
+    risk set = offline ranked Top600 Layer/Heads
+    risk row budget = [20, 32]
+    promotion threshold = 24/48
 
-1. Permute video Q/K/V with Hilbert3D; preserve dense text/boundary policy.
+0. Steps 0–11 use dense attention.
 
-2. Compute cheap Q16/K16 mean-pooled score for all heads.
+1. Hilbert3D-permute video Q/K/V; preserve dense text/boundary policy.
 
-3. Aggregate cheap scores into Q128/K96 Macro scores.
+2. At route-refresh steps 12/24/36, compute cheap mean-pooled Q16/K16
+   probability scores for all heads.
 
-4. For each (head, Q128), select top ceil(rho_C * N_K96) Macro blocks as Core.
+3. Aggregate them into Q128/K96 Macro scores and select dynamic Macro Top-k Core.
 
-5. For each Layer/Head:
-       if (layer, head) in G_risk:
-           compute sampled-LSE Q16/K16 probability P_hat
-           k_min, k_max = 20, 32
-       else:
-           reuse cheap Q16/K16 probability P_hat
-           k_min, k_max = 0, 16
+4. For Layer/Heads in risk_top600 only:
+       compute sampled-LSE Q16/K16 probabilities;
+       compute Core mass under sampled-LSE probabilities;
+       select complement prefix toward total mass 0.90;
+       clamp each Q16 row to 20–32 tiles.
 
-6. For each (head, Q16):
-       compute Core mass under P_hat
-       find minimum complement prefix reaching total mass 0.90
-       clamp selected count into [k_min, k_max]
-       keep the highest-scoring complement K16 tiles
+5. Promote any Macro containing at least 24 selected Residual microtiles;
+   remove promoted positions from Residual.
 
-7. Count selected Microtiles inside every non-Core Q128/K96 Macro.
-       occupancy >= 24: promote whole Macro to Core
-       otherwise: retain selected Q16/K16 in Residual CSR
+6. Build/cache direct Macro CSR and compact Residual CSR.
 
-8. Run Core with FlashInfer FA3 -> (O_C, LSE_C).
+7. Run Core with FlashInfer FA3 and Residual with grouped Triton/MMA.
 
-9. Run non-empty Residual rows with grouped Triton/MMA -> (O_R, LSE_R).
+8. Exact-LSE merge and inverse permutation.
 
-10. Exact-LSE merge and inverse permutation.
+9. Reuse the route through the remainder of each 12-step interval.
 ```
 
----
+代码中的实际调用关系如下；这是复现方法时应遵循的顺序，而不是概念性伪代码的重新解释：
 
-## 11. 与纯 DFSAttn 的本质区别
+| 顺序 | 实际函数/位置 | 输入到输出 |
+|---:|---|---|
+| 1 | `attention_hyvideo.py::_compute_flashinfer64_tile_schedule` | 由 `step_idx/skip_steps/cache_interval` 产生刷新标志和当前 Macro ratio |
+| 2 | `flashinfer64_attention.py::compute_micro_tile_scores` | `Q,K [H,N,d] → cheap probability [H,Q16,K16]` |
+| 3 | `aggregate_macro_scores` | `[H,Q16,K16] → [H,Q128,K96]`，先对 K16 求和、再对 8 个 Q16 求均值并沿 K 归一化 |
+| 4 | `_select_hyvideo_core_tiles` | 依据动态 Top-k 和 dense text/boundary policy 生成 Core bool mask |
+| 5 | `compute_peak_aware_micro_tile_scores` | 只切出当前 layer 的风险 heads，生成 sampled-LSE 概率；默认 `q_chunk_size=128` |
+| 6 | `_select_residual_to_total_mass` | 从非-Core K16 中按 sampled-LSE 排序，执行 total Top-p，并将数量 clamp 到 `20–32` |
+| 7 | `_promote_residual_microtiles` | 统计每个 `8×6` Micro group；occupancy `≥24` 时写入 Core，并从 Residual 清除 |
+| 8 | `_build_residual_csr` | 将剩余 bool support 压为 `indices/indptr`，按非空行长度分 bucket |
+| 9 | Core/Residual kernels | FlashInfer FA3 执行 Macro CSR；grouped Triton/MMA 执行 Residual CSR |
+| 10 | exact LSE merge | 用两支的 output 与 LSE 合并，最后做 inverse Hilbert3D permutation |
 
-| 维度 | 纯 DFSAttn | HyMoR-Attn |
-|---|---|---|
-| 细粒度信息用途 | 用于改善大块排名 | 同时用于真实 Microtile 执行 |
-| 主执行粒度 | 规则大块 | Q128×K96 Core + Q16×K16 Residual |
-| Core 预算 | 固定大块 Top-k | 硬件对齐 Macro Top-k，比例由 Pareto profiling 确定 |
-| Query 自适应预算 | 较弱 | complement total Top-p |
-| proxy 失败保护 | 无显式安全下界 | 校准得到的 Layer/Head Top-k floor |
-| 固定 K anchor | 不适用 | 明确不作为主方法 |
-| 局部过密处理 | 整体由大块定义 | occupancy-based promotion |
-| softmax | 单一 block kernel | 两支状态 exact LSE merge |
-| 预期优势 | kernel 规则、实现成熟 | 稠密支持走 Macro、分散支持走 Micro；相同时间保留更多高价值交互 |
-
-因此，论文的核心比较不能只看“谁的 block 更小”或“谁的 density 更低”，而应比较：
-
-1. **matched E2E latency** 下，谁能保留更多有效 attention mass 并获得更高视频质量；
-2. **matched video quality** 下，谁具有更短的端到端时间；
-3. 从相同的 pre-dispatch Fine candidate set 出发，occupancy-aware Macro/Micro dispatch 是否比统一 Macro 或统一 Micro 获得更好的质量—时间折中；
-4. matched QK density 仅作为诊断协议，用于拆分“选得更好”和“执行得更好”，不作为最终主叙事。
+路由仅在 step `12/24/36` 重建。每层都有自己的 attention wrapper；该层在后续 diffusion
+steps 上命中 cache key 时，直接复用已缓存的 Core、Residual CSR 和 plan。因此不能把
+scorer、排序和 CSR 构建成本当成每一个 diffusion step 都重复发生。`sampled_lse_random`
+只在步骤 6 后替换 support 坐标，步骤 7–10 与主方法完全相同。
 
 ---
 
-## 12. 实验设计
+## 11. 当前主实验配置与评测口径
 
-### 12.1 数据划分
-
-必须将风险先验和 scorer calibration 与最终评测分离。
-
-建议：
-
-- Calibration：至少 8–16 个 prompts，2 个 seeds；先覆盖全部 layers 做轻量风险扫描，再对候选 layers 做逐 K16 分析，用于确定 `G_risk`、temperature 和可选时间 bias；
-- Validation：独立 8 个 prompts；用于选择 `rho_C/p_total/k_min/k_max/tau`；
-- Test：VBench 33 prompts，至少 seed 0；论文主结果尽可能补充 3 seeds；
-- 分辨率：先在 `480×720` 完成完整消融，再在 `720×1280` 验证可扩展性；
-- 所有方法保持 prompt、seed、scheduler、CFG、steps 和 dense warmup 完全一致。
-
-若计算预算不足，至少保证 calibration prompts 与最终 33 prompts 无重合，并对主要质量/E2E 指标报告 bootstrap 95% confidence interval。
-
-### 12.2 Baselines
-
-主表至少包括：
-
-1. Full Attention；
-2. 原生 DFSAttn；
-3. `Q128×K96` Core-only；
-4. Macro Top-k + 当前 mean-proxy total Top-p；
-5. 当前 `fine_topk_occupancy` 路由；
-6. HyMoR-Attn，无风险 floor；
-7. 完整 HyMoR-Attn；
-8. Dense-mass oracle，仅作为算法上界，不报告为可部署方法。
-
-为了单独验证硬件粒度分配，必须对完整 HyMoR 生成的**同一份 pre-dispatch Fine candidate set**增加三种执行对照：
-
-1. `All-Macro`：凡是包含被选 Microtile 的 Macro 均 densify 后执行；
-2. `All-Micro`：所有被选 interactions 都按 Q16×K16 CSR 执行；
-3. `Adaptive`：根据 occupancy/kernel crossover 分配到 Macro 或 Micro。
-
-三者的选择分数、pre-dispatch Fine candidates 和 Q/K/V 输入必须一致，但执行 support 不会完全相同：All-Micro 精确执行 Fine support；All-Macro 执行其最小 Macro cover；Adaptive 只对高 occupancy 部分取 Macro cover。必须同时比较 kernel latency、E2E latency、实际执行 interactions、support expansion、输出质量和显存。纯 kernel crossover 另外使用合成等价 workload 测量，避免把由 support 扩张产生的质量变化误归因为 kernel 本身。
-
-如论文对比外部方法，应严格匹配模型、分辨率、steps 和 realized density，不能直接抄不同论文中的 speedup。
-
-### 12.3 机制实验
-
-在现有逐 K16 add-back 数据上首先比较 scorer：
-
-| Scorer | 用途 |
+| 参数 | 当前值 |
 |---|---|
-| Mean-pooled QK | 当前实现基线 |
-| Max representative QK | 峰值消融 |
-| Sampled log-mean-exp | 主方法 |
-| Sampled-LSE + temperature | calibration 消融 |
-| Sampled-LSE + temporal bias | 时间先验消融 |
-| Dense K16 mass | oracle 上界 |
+| 模型 | HunyuanVideo |
+| Seed | 0 |
+| 分辨率 | `480×720` 和 `720*1280 ` |
+| 帧数 | 129 |
+| Diffusion steps | 50 |
+| Dense warmup | 12 steps |
+| Route cache interval | 12 |
+| Route mode | `topk_topp` |
+| Dynamic Macro ratio | `0.30→0.20→0.10` |
+| Residual scorer | `sampled_lse` |
+| Risk set | Top600 |
+| Total Top-p | 0.90 |
+| Residual bounds | 20–32 K16 tiles/Q16 row |
+| Sampled-LSE temperature | 1.0 |
+| Promotion threshold | 24/48 |
+| Residual backend | `micro` |
+| Route/direct CSR | enabled |
 
-报告：
+VBench33 正确 dense reference：
 
-- Recall@1/5/20；
-- `Recovered-ΔE@1/5/20`；
-- NDCG 或 rank correlation；
-- 严重遗漏上的 Residual-empty rate；
-- 每 Q16 的 Residual mean/p50/p95/max；
-- scorer latency 和峰值显存。
+`/cnic/work/liutt/mywork/attention/ttresult/vbench/t2v/dense/Step_50-Res_480p`
 
-其中：
+VBench66 正确 dense reference：
 
-\[
-\operatorname{Recovered\text{-}\Delta E@k}
-=\frac{\max_{j\in\operatorname{Top}k}\Delta E_j}
-{\max_{j\in\mathrm{all\ omitted}}\Delta E_j}.
-\]
+`/cnic/work/liutt/mywork/attention/ttresult/vbench/t2v/densep66/Step_50-Res_480p`
 
-这个指标比“是否命中唯一 oracle-best”更稳定，因为多个候选可能具有非常接近的恢复收益。
-
-### 12.4 方法消融
-
-质量路由按以下顺序逐项加入：
-
-```text
-Macro Core-only
-  + mean-proxy total Top-p
-  + sampled-LSE scorer
-  + Layer/Head risk floor
-  + k_max cap
-  + temperature calibration
-  + optional temporal bias
-```
-
-硬件执行单独做正交消融：
-
-```text
-Fixed pre-dispatch Fine candidate set
-  ├─ All-Macro
-  ├─ All-Micro
-  ├─ Static tau promotion
-  └─ Profiled crossover-based adaptive dispatch
-```
-
-这样可以分别回答：
-
-- scorer/risk prior 是否提高了每单位逻辑计算的质量；
-- granularity allocator 是否用可控的 support rounding 获得更优的物理执行时间—质量折中；
-- 两者联合后是否构成相对 DFSAttn 的严格质量—延迟 Pareto 优势。
-
-另设两个负对照：
-
-- 跨视频固定 K16 anchor；
-- 只使用空间/Hilbert 局部窗口。
-
-它们用于证明稳定先验存在于“风险位置”，而不是“固定 Key 坐标”。
-
-### 12.5 超参数 sweep
-
-建议使用分阶段小网格，避免全组合爆炸：
-
-```text
-Core ratio rho_C:       {0.12, 0.16, 0.20, 0.25}
-Total p:                {0.80, 0.90, 0.95}
-Risk k_min:             {8, 12, 20}
-Normal/Risk k_max:      {(8,24), (16,32), (32,64)}
-Promotion tau:          {16, 24, 32}
-Representative count:  {2, 4, 8}
-```
-
-先用 snapshot selector 指标筛选，再运行视频，不能直接对所有组合生成完整视频。
-
-### 12.6 视频质量指标
-
-以相同 prompt/seed 的 Full Attention 视频为 reference，报告：
-
-- PSNR ↑；
-- SSIM ↑；
-- LPIPS ↓；
-- temporal LPIPS 或相邻帧一致性指标；
-- VBench 语义和时序维度；
-- 失败样例的可视化，特别关注网格、局部结构断裂、主体漂移和运动不连续。
-
-PSNR/SSIM/LPIPS 衡量 sparse 对 Full 的 fidelity，VBench 衡量生成语义质量，两者不能互相替代。
-
-### 12.7 系统指标
-
-必须分开记录：
-
-```text
-QKV permutation
-cheap score
-peak-aware score
-Macro aggregation/select
-Residual select
-occupancy/promotion
-CSR compact/plan/expand
-Core kernel
-Residual kernel
-LSE merge
-output inverse permutation
-E2E GPU time
-wall time
-peak memory
-```
-
-同时报告：
-
-- Core/Residual/最终实际 QK interaction density；
-- promotion 数量和 occupancy histogram；
-- Residual row length histogram；
-- Core 和 Residual 的有效 TFLOPS/带宽；
-- route refresh 与 cache-hit step 的时间差；
-- 不包含首次 Triton/CUDA 编译的 steady-state 时间。
+质量使用 `videometric.py`，逐帧对齐 129 帧并计算 PSNR、SSIM、Alex-LPIPS。VBench33
+不得使用 `densep33/Step_50-Res_720p`；旧文档中 prompt 18 之后错误交换 scene、
+subject-consistency、temporal-flickering reference 的结果也不得继续引用。
 
 ---
 
-## 13. 已有性能事实与当前缺口
+## 12. 已完成实验结果
 
-现有 HunyuanVideo prompt-0 结果中：
+### 12.1 VBench66 Top-p 选择（每组 10 视频）
 
-- 原始 DFSAttn 平均最终 density 约 `19.67%`，E2E GPU 为 `200.957 s`；
-- FlashInfer64 两支路径 density 约 `17.61%`；
-- 未缓存的完整 Micro residual 路径 E2E 为 `288.659 s`，说明 route/plan/格式准备会抵消低 density；
-- RoDe cache-only center-token 路径达到 `199.514 s`，与 DFSAttn 基本持平，但 center-token 与完整 Q16×K16 在质量语义上不等价；
-- 修复 CSR expand 后的另一组 route-cache 实验仍比 DFSAttn 慢约 `4.2%`，说明速度优势尚未被完整证明。
+| Total Top-p | 平均 density | E2E(s) | PSNR ↑ | SSIM ↑ | LPIPS ↓ |
+|---:|---:|---:|---:|---:|---:|
+| 0.80 | 0.198158 | 209.024 | 27.462743 | **0.879005** | 0.085606 |
+| 0.85 | 0.198313 | **206.313** | 27.475436 | 0.878770 | 0.085575 |
+| 0.90 | 0.198495 | 206.358 | 27.480280 | 0.878403 | 0.085497 |
+| 0.95 | 0.198716 | 209.974 | **27.492177** | 0.878274 | **0.085327** |
 
-因此目前可以声称：
+`p=0.80→0.95` 仅带来 `+0.029434 dB` PSNR、`-0.000279` LPIPS，同时 SSIM
+降低 `0.000731`；差异很小。`p=0.90` 是后续实验使用的折中点，不是所有质量指标均最优。
 
-> 算法上存在明确的细粒度恢复空间；Macro/Micro 异构执行已具备数值正确路径；但“完整质量语义下端到端快于 DFSAttn”仍是待验证目标。
+### 12.2 完整 VBench33 主结果（33 视频）
 
-目前不能声称：
+| 方法 | Density | E2E(s) | PSNR ↑ | SSIM ↑ | LPIPS ↓ |
+|---|---:|---:|---:|---:|---:|
+| 原始 DFSAttn | 0.196713 | 未记录 | 28.432356 | 0.885323 | 0.096305 |
+| Top600 + proxy | 0.198259 | 198.213 | 28.890878 | **0.892962** | 0.087106 |
+| Top300 + sampled-LSE | 0.196519 | 202.087 | 28.940509 | 0.890886 | 0.087089 |
+| Top600 + sampled-LSE | 0.198402 | 206.683 | **29.015273** | 0.890673 | **0.086073** |
 
-- 现有 FlashInfer64 已经稳定快于 DFSAttn；
-- RoDe center-token 结果证明完整 Residual 的质量或速度；
-- 当前 mean proxy 的 total Top-p 已经是有效的严重遗漏发现器；
-- layer 12/head 5/8/18 是跨模型普适规律。
+Top600 sampled-LSE 相对 DFSAttn：
 
----
+```text
+ΔPSNR  = +0.582917 dB
+ΔSSIM  = +0.005350
+ΔLPIPS = -0.010232
+Δdensity = +0.001690
+```
 
-## 14. 合理预期的最终实验结果
+这给出 Pareto 结论中的质量轴：只增加约 `0.169` 个百分点的全局 density，三个 fidelity
+指标均优于 DFSAttn。速度轴使用下述独立计时记录，不用缺失的 DFSAttn 本批次 timing
+反推时间。
 
-### 14.1 预期依据
+Top600 sampled-LSE 相对 Top600 proxy：
 
-预期建立在以下已知事实上：
+```text
+ΔPSNR  = +0.124395 dB
+ΔSSIM  = -0.002289
+ΔLPIPS = -0.001034
+ΔE2E   = +8.470 s（慢约 4.27%）
+```
 
-1. Macro 漏选收益可由少量 K16 高比例恢复；
-2. Dense mass oracle 在 Core ratio `0.16` 下 Recall@20 达到 `99.4%`；
-3. 全 Layer calibration 完成后，再根据实际覆盖率决定风险 floor 的 Layer/Head 范围；早期“一个 layer 的三个 heads”仅是待验证候选；
-4. 同一批 Fine candidates 可以依据局部 occupancy 选择精确 Micro 执行或受控 Macro rounding，因此目标 support、实际执行 support 与物理成本不再被单一粒度绑定；
-5. 当前系统距离 DFSAttn 的速度差主要取决于 granularity dispatch、selector、plan、CSR 和 Residual 调度，说明端到端优势必须来自整条硬件执行路径，而不能只依赖更低 QK density。
+这组 scorer 对照说明 sampled-LSE 相对 proxy 的收益集中在 PSNR/LPIPS，并额外消耗
+`8.470 s`；它用于比较 scorer，不是论文中约 `20 s` 速度收益的基线。
 
-最大不确定性是 sampled-LSE scorer 能否将当前 `9.8%` Recall@20 显著推近 dense oracle，以及其实际排序/访存开销。
+Top600 相对 Top300 sampled-LSE 仅提高 `0.074763 dB` PSNR、降低 `0.001017` LPIPS，
+同时 SSIM 低 `0.000213`、E2E 增加 `4.596 s`。风险集合继续扩大后的边际收益有限。
 
-### 14.2 Selector 结果预期
+### 12.3 机制消融（相同 11 个 VBench33 视频）
 
-| 指标，Core ratio=0.16 | 当前 mean proxy | HyMoR 合理预期 | Dense oracle |
+共同 prompt 为 `0,3,6,9,12,15,18,21,24,27,30`。
+
+| 方法 | Density | E2E(s) | PSNR ↑ | SSIM ↑ | LPIPS ↓ |
+|---|---:|---:|---:|---:|---:|
+| Top600 sampled-LSE | 0.198352 | 207.391 | **28.907922** | **0.900680** | **0.083894** |
+| 随机600头 + sampled-LSE | 0.198351 | **206.409** | 28.723870 | 0.898160 | 0.089747 |
+| Top600 + sampled-LSE-count-matched 随机 token | 0.198437 | 210.797 | 28.563881 | 0.899358 | 0.086954 |
+
+相对正常 Top600 sampled-LSE：
+
+| 消融 | ΔPSNR | ΔSSIM | ΔLPIPS | 质量胜出数量（PSNR/SSIM/LPIPS） |
+|---|---:|---:|---:|---:|
+| 随机600头 | -0.184052 | -0.002520 | +0.005853 | 2/3/4（共11） |
+| 等数量随机 token | -0.344042 | -0.001322 | +0.003060 | 2/3/2（共11） |
+
+在 prompt 维度的事后配对检验中，正常 sampled-LSE 相对等数量随机 token 的 PSNR 差异
+达到显著（paired t-test `p≈0.0059`，Wilcoxon `p≈0.0049`）；SSIM 和 LPIPS 方向一致。
+
+### 12.4 早期机制证据
+
+早期遗漏 Macro add-back 表明，完整 Macro 的恢复收益集中在少数 K16：
+
+| Microtile 选择 | Top1 K16 | Top2 K16 | Top4 K16 |
 |---|---:|---:|---:|
-| 严重遗漏 Recall@5 | 5.2% | 45%–70% | 97.7% |
-| 严重遗漏 Recall@20 | 9.8% | 70%–90% | 99.4% |
-| Recovered-ΔE@20 | 待统一统计 | 0.80–0.95 | 约 1.0 |
-| 严重遗漏 Residual-empty rate | 60.1% | 0%–10% | 取决于预算规则 |
-| Residual row p95 | 可能数百 | ≤32（由 cap 保证） | 不适用 |
+| Dense oracle 恢复完整 K128 收益 | 51.5% | 73.9% | 90.4% |
+| mean proxy | 35.0% | 54.5% | 78.0% |
+| 随机 | 13.2% | 26.2% | 51.5% |
 
-如果 sampled-LSE 的 Recall@20 低于 `50%` 或 Recovered-ΔE@20 低于 `0.70`，说明代表 token 规则仍没有保住关键方向，应停止大规模视频实验，转向学习型 scorer 或增加代表数。
-
-### 14.3 Pareto 主结果预期
-
-以原始 DFSAttn 的约 `19.7%` density 和单 prompt `200.957 s` E2E 为参考，主结果应追求严格的 Pareto improvement，而不是预设必须降低 logical density：
-
-| 指标 | 合理预期 |
-|---|---:|
-| 最终 logical interaction density | 18%–22%，允许与 DFSAttn 相近或略高 |
-| E2E GPU time | 185–195 s |
-| E2E 相对 DFSAttn | 快 3%–8% |
-| PSNR 相对 DFSAttn | +0.2 至 +0.8 dB |
-| SSIM 相对 DFSAttn | +0.003 至 +0.015 |
-| LPIPS 相对 DFSAttn | -0.005 至 -0.020 |
-| VBench | 持平或小幅提高；不以 fidelity 提升推断语义分数必然提升 |
-
-这里允许 logical density 略高，是因为论文假设恰恰是：更合理的 Macro/Micro 映射可以用更低的物理执行成本承载更多高价值 interactions。若方法只靠降低 density 才获得速度，而视频质量仅持平，则不能充分支持本文的硬件粒度分配主张。
-
-上述数字是合理目标区间，不是已有测量。最有说服力的最终结果应同时满足：相对 DFSAttn，E2E 显著下降，并且 PSNR/SSIM 提高、LPIPS 降低；即同一个运行点在速度和视频质量两个坐标上都严格占优。
-
-### 14.4 端到端性能预期
-
-以现有单 prompt DFSAttn `200.957 s` 为同机器参考，可以给出三档合理情景：
-
-| 情景 | 方法状态 | 预期 E2E | 相对 DFSAttn |
-|---|---|---:|---:|
-| 保守 | scorer 有效，但 granularity dispatch/CSR 开销较高 | 198–205 s | 持平附近，尚未形成强 Pareto 优势 |
-| 论文目标 | dispatcher 命中 kernel crossover，scorer 分块融合、route cache 和 Micro bucket 有效 | 185–195 s | 快 3%–8% |
-| Stretch | Residual 极稀疏且 selector/CSR 高度融合 | 177–185 s | 快 8%–12% |
-
-主论文不应预先承诺 Stretch 数字。更可信的目标是稳定获得 `3%–8%` E2E 加速，同时在同一个配置上展示明确的视频质量提升。720p 应报告实际测量，不从 480p 线性外推。
-
-### 14.5 论文成败标准
-
-进入最终论文主表前，建议同时满足：
-
-```text
-Mechanism:
-    Recall@20 on severe omissions ≥ 70%
-    Recovered-DeltaE@20 ≥ 0.80
-    Severe-omission residual-empty rate ≤ 10%
-
-Quality:
-    PSNR ≥ DFSAttn + 0.2 dB
-    SSIM > DFSAttn and LPIPS < DFSAttn
-    No systematic grid/temporal artifacts
-
-System:
-    Residual p95 ≤ 32 K16 tiles
-    Peak-aware scorer ≤ 10% of sparse attention time
-    E2E speedup ≥ 3% on the same held-out outputs
-    From matched pre-dispatch candidates, adaptive dispatch Pareto-dominates all-Macro/all-Micro
-    No result relies on first-run compilation or center-token approximation
-```
-
-如果质量明显提高但 E2E 未加速，工作更接近“精度修复方法”，系统主张需要收缩；如果 E2E 加速但质量没有提高，则只能说明执行优化，不能支持 Pareto dominance；如果二者都改善但 adaptive dispatch 从 matched pre-dispatch candidates 出发没有优于统一粒度，则不能把加速归因于粒度分配。最终必须同时闭合 selector、quality、granularity dispatch 和 E2E 四层证据。
+K96 Core ratio `0.16` 的机制扫描中，dense K16 mass oracle Recall@20 为 `99.4%`，而早期
+mean proxy Recall@20 仅 `9.8%`。这些结果解释了为什么要引入 peak-aware sampled-LSE 和
+风险预算，但它们不是当前 VBench 主结果本身。
 
 ---
 
-## 15. 论文叙事建议
+## 13. 论文结论与数据对应关系
 
-### 15.1 推荐标题方向
+### 13.1 质量—速度 Pareto 结论
 
-可以从以下方向继续凝练：
+1. 粗粒度 Core 的遗漏收益具有长尾，少数 K16 tiles 可以恢复较大比例的输出质量；
+2. 在近似相同的 density/逐行 tile 数下，sampled-LSE 位置优于proxy优于随机位置；
+3. 风险排名 Top600 的平均质量优于随机600头，说明预算投放位置有价值
+4. 相对 DFSAttn，当前 Top600 sampled-LSE 以约 `0.169` 个百分点的全局 density 增量取得
+   `+0.583 dB` PSNR、`+0.00535` SSIM 和 `-0.01023` LPIPS；
+5. Core/Residual 两支执行和 exact LSE merge 已落地，主质量实验不是 center-token 近似；
+6. 端到端生成时间约降低 `20 s`，与 fidelity 收益 + 0.7dB 共同构成速度—质量 Pareto 优势。
 
-1. **HyMoR-Attn: Hardware-Aware Macro–Micro Routing for Faster and Higher-Quality Video Diffusion**
-2. **Recovering What Blocks Miss: Heterogeneous Macro-Micro Sparse Attention for Video Diffusion**
-3. **Beyond Block Sparsity: Risk-Aware Fine-Grained Residual Attention for Video Generation**
 
-第一种强调系统与完整方法；第二种更适合突出机制发现；第三种强调相对 DFSAttn 的算法改进。
+### 13.2 写作时必须保留的实验口径
 
-### 15.2 摘要叙事骨架
 
-可以按以下逻辑展开：
+2. Top600 是由当前离线 add-back 数据排序得到的固定风险集合；
+3. 在线最小选择单位是 `Q16×K16` tile，不是单 token；
+4. 速度使用 `e2e_generation_wall` 实测，density 只报告 support 比例，不代替 runtime；
+5. 随机头和随机 token 消融为10% vbench数据集，主实验为vbench全集
 
-1. Block sparse attention 为视频扩散带来规则 GPU 执行，但把所有 selected support 统一映射到大块会在局部稀疏区域浪费计算；统一使用小块又会在局部稠密区域损失 Tensor-Core 效率；
-2. 通过逐 Macro/K16 add-back，发现 attention support 同时具有局部稠密主体和分散高价值残差，且少量 K16 能获得完整 Macro 的大部分质量收益；
-3. 进一步发现严重遗漏在 Layer/Head 层面集中，却在具体 K 坐标上随内容变化，同时现有 mean-pooled proxy 无法识别真实高质量 K16；
-4. 因此提出 HyMoR-Attn：固定 Macro Top-k backbone、peak-aware Micro total Top-p、calibrated risk floor，以及由局部 occupancy 驱动的 Macro/Micro hardware granularity allocator；
-5. 稠密区域交给 FA3 Macro kernel，分散区域交给 Triton Micro kernel，并通过 exact LSE merge 保持数学正确；route cache、CSR 和 kernel crossover profiling 控制系统开销；
-6. 最终在同一运行点上同时取得低于 DFSAttn 的端到端时间和更高的视频质量，形成严格的 quality-latency Pareto dominance。
-
-### 15.3 最重要的图表
-
-论文至少需要以下四张核心图：
-
-1. **机制图**：一个未选 Macro 内少量高 dense-mass K16 被 mean pooling 淹没，以及逐 K16 add-back 后误差恢复；
-2. **三层方法图**：Macro Core、Micro Residual、promotion 与 exact LSE merge；
-3. **Granularity crossover 图**：固定相同 Fine candidates，画出不同 occupancy 下 all-Micro、Macro cover 和 adaptive dispatch 的 kernel latency及 support expansion；
-4. **Selector 曲线**：Recall/Recovered-ΔE 随 K16 budget 变化，比较 mean、sampled-LSE 和 oracle；
-5. **主 Pareto 图**：PSNR/LPIPS 对 E2E latency，展示 Full、DFSAttn、Core-only、当前 hybrid 和 HyMoR；density 图作为辅助诊断。
-
-附加图可以包括 Layer×Head 风险热力图、K16 位置跨视频不稳定图、Residual row-length 分布和 occupancy/kernel crossover。
 
 ---
 
-## 16. 局限性与 reviewer 可能质疑的问题
+## 14. 与 DFSAttn 的当前区别
 
-### 16.1 风险先验是否过拟合 HunyuanVideo
+| 维度 | DFSAttn | 当前 HyMoR-Attn |
+|---|---|---|
+| 主支持粒度 | 规则大块 | Q128×K96 Core + Q16×K16 Residual |
+| Core score | 细粒度 proxy 后聚合 | 同样使用 cheap mean proxy 聚合 |
+| Core 预算 | 动态 block ratio | 同步采用 `0.30→0.20→0.10` 动态比例 |
+| 高风险检测 | 无显式风险集合 | 离线 Top600 Layer/Head |
+| Residual score | 无该分支 | mean+3 representatives sampled-LSE |
+| Residual 预算 | 无 | total Top-p 0.90，逐风险行 20–32 |
+| 局部过密 | 由大块路由决定 | 24/48 occupancy promotion |
+| 执行 | 单 block-sparse 路径 | FlashInfer Core + Triton Residual |
+| 输出合并 | 单分支 softmax | exact LSE merge |
 
-回应方式：方法定义的是 calibration-derived risk set，而不是写死 layer/head ID；必须增加跨 prompt、seed 和至少一个额外模型的验证。若额外模型风险位置不同但同一校准流程仍有效，反而能强化方法主张。
+现有结果支持以**速度—质量 Pareto 优势**作为论文主结论。
 
-### 16.2 当前机制数据是否有采样偏差
 
-现有数据过采样了高误差 Q16。论文应明确这一点，并在完整 Query 分布上报告严重遗漏自然发生率、风险集合覆盖率及额外预算占比。
-
-### 16.3 单块 `ΔE` 能否代表多块联合恢复
-
-不能完全代表。多个 K16 同时加入会共享 softmax 分母，独立 `ΔE` 不可相加。现有 `ΔE` 适合训练/评价候选排序，最终必须通过联合 mask replay 和真实视频生成验证。
-
-### 16.4 Sampled-LSE 是否真的比 mean proxy 便宜
-
-算术量很低不等于实际 latency 低。需要 fused representative extraction、chunked scoring 和 GPU Top-k，并报告 selector 的真实时间与显存。若 scorer 开销过高，可退化为只在 risk heads 的 frontier candidates 上运行，但需要测量 frontier recall。
-
-### 16.5 为什么不直接把风险 heads 设为 dense
-
-将整个 head 设为 dense 会恢复质量，但丢失大部分 sparsity，且无法证明 Microtile 可恢复机制。应将“risk heads dense”作为质量上界和成本较高的 baseline，而不是主方法。
-
-### 16.6 为什么不用固定 K anchor
-
-现有留一视频实验已经显示固定位置泛化失败。稳定的是 Layer/Head 风险，不是 Key 坐标；主方法仍在线、随内容选择 K16。
-
----
-
-## 17. 实现落地顺序
-
-建议严格按以下顺序推进。由于论文的主叙事是硬件粒度分配带来 Pareto 改善，首先验证执行侧，再扩展质量侧：
-
-1. 对固定 logical support 构造不同 occupancy 的 microbench，测出 `T_micro(o)` 与 `T_macro(48)` crossover；
-2. 对同一真实 route 实现 All-Macro、All-Micro、Adaptive 三种 replay，确认 Adaptive 的 kernel/E2E 时间最低；
-3. 在现有 snapshot/add-back 数据上实现 sampled-LSE 离线 scorer，不改推理 kernel；
-4. 输出 Recall@k、Recovered-ΔE@k 和 row-length，确认达到 selector gate；
-5. 在 `topk_topp` 中加入 per-layer/head `k_min/k_max`，先继续使用现有 score，验证预算语义和统计正确性；
-6. 接入 risk-head sampled-LSE，并使用 chunked GPU scoring；
-7. 验证 Core/Residual 不重叠、Macro rounding 的 support expansion 与构造出的 reference mask 一致、exact LSE merge 数值正确；
-8. 在保存 QKV 上做 mask replay，比较 Core-only、旧 scorer、新 scorer 和 oracle 的联合输出误差；
-9. 运行单 prompt 视频因果实验，要求同一配置同时优于 DFSAttn 的 E2E 与质量；
-10. 完成 480p 33 prompts 后再优化 selector/CSR 并运行 720p；最后才考虑学习型 scorer、动态 anchors 或双 stream 等扩展。
-
-当前仓库启动时需要特别注意：shell 默认 route 是 `fine_topk_occupancy`，且当前 `FLASHINFER64_CORE_ONLY` 默认值为 `True`。要运行本方法的现有近似基线，必须显式设置：
-
-```bash
-SPARSE_EXECUTION=flashinfer64 \
-FLASHINFER64_ROUTE_MODE=topk_topp \
-FLASHINFER64_TILE_TOP_RATIO=0.16 \
-FLASHINFER64_TOKEN_TOP_P=0.90 \
-FLASHINFER64_PROMOTION_THRESHOLD=24 \
-FLASHINFER64_ROUTE_CACHE=True \
-FLASHINFER64_CORE_ONLY=False \
-FLASHINFER64_RESIDUAL_BACKEND=micro \
-FLASHINFER64_PARALLEL_CORE_RESIDUAL=False \
-FLASHINFER_CSR_EXPAND_CTA_MULTIPLIER=0 \
-bash hyvideo_t2v_720p_dfs.sh
-```
-
-这条命令仍使用当前 mean-pooled scorer，也没有 risk floor，只能作为实现前基线，不能标记为完整 HyMoR-Attn。
-
----
-
-## 18. 最终判断
-
-现有证据足以支持继续推进这个研究方向，但支持的是以下更严格的版本：
-
-> **以固定、硬件友好的 Macro Top-k 提供主体计算；以保留峰值的 Microtile mass proxy 在线发现内容相关遗漏；以校准得到的 Layer/Head 先验分配检测强度和 Top-k 安全下界；以 occupancy promotion 和 exact LSE merge 完成高效且数学正确的异构执行。**
-
-它相对纯 DFSAttn 的潜在优势来自“更合理的物理执行粒度承载更高质量的逻辑 support”：局部稠密部分利用 Macro kernel 的规则吞吐，分散高价值部分利用 Micro kernel 避免块内浪费。论文能否成立最终取决于三个闭环：
-
-1. sampled-LSE scorer 是否能在 `≤20/32` 的预算内显著接近 dense-mass oracle；
-2. occupancy-aware dispatcher 是否从相同 Fine candidates 出发，通过受控 Macro rounding 同时优于 all-Macro 与 all-Micro 的质量—时间折中；
-3. 执行侧节省是否足以覆盖 scorer、CSR 和 merge 开销，并允许保留更多高价值 interactions，使最终视频质量和 E2E 时间同时优于 DFSAttn。
-
-若三者同时成立，HyMoR-Attn 有机会形成一篇由机制证据、质量路由、硬件粒度分配和端到端 Pareto 结果共同支撑的完整论文
-
----
-
-## 19. 本文档的数据来源索引
-
-- `finding.md`：K96 Core ratio `0.25/0.20/0.16` 的逐 K16 add-back、严重遗漏、Layer/Head、位置泛化和当前 proxy 召回结论；
-- `writing-block(1).md`：早期 Q128×K128 Macro 漏选、长尾误差和 Macro 内 Top1/2/4 K16 恢复比例；
-- `already2.md`：Q128×K96 Core、Q16×K16 Residual、promotion、CSR、FlashInfer/Triton 执行和 exact LSE merge 的当前实现；
-- `timeres.md`：原始 DFSAttn、完整 Micro residual、RoDe center-token、cache 和端到端时间；
-- `chat.md`：CSR expand 修复前后及 route-cache timing 分析；
-- `hyper.md`：当前启动参数及不同 route mode 的实际生效关系；
-- `phasea.md`：Block Top-p + exact Token Top-k 的早期 oracle 实验设计；
-- `toppksurvey.md`：Top-k、Top-p、hybrid floor 和动态预算的相关工作线索。

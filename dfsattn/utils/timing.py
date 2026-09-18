@@ -121,6 +121,7 @@ class AttentionTimingRecorder:
             "flashinfer_occupancy",
             "flashinfer_partition",
             "flashinfer_residual_select",
+            "flashinfer_peak_score",
             "flashinfer_promotion",
             "flashinfer_residual_compact",
             "flashinfer_plan",
